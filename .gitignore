@@ -1,0 +1,35 @@
+# 数据与密钥：绝不能提交
+data/
+*.db
+*.db-shm
+*.db-wal
+master.key
+ck.txt
+srv.log
+
+# 服务器凭据 / 会话 Cookie / 远程执行脚本：绝不提交
+askpass.sh
+rsh.sh
+sv.txt
+sv2.txt
+sv3.txt
+
+# 含真实服务器 IP / root 账号的本机专属部署记录
+DEPLOY-SERVER.md
+
+# 构建产物与压缩包
+*.tar.gz
+*.tgz
+
+# 编辑器/工具锁文件
+.dsh-ops-update-*.lock
+
+# 依赖（本项目零依赖，保留以防万一）
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

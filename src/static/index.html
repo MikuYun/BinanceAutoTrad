@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>币安量化终端</title>
+<link rel="stylesheet" href="./styles.css">
+<script>
+/* 首屏前恢复主题，避免闪白 */
+(function () {
+  try {
+    var t = localStorage.getItem('theme') || 'dark';
+    if (['dark', 'light', 'blue', 'warm'].indexOf(t) < 0) t = 'dark';
+    document.documentElement.dataset.theme = t;
+    document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+  } catch (e) { /* 隐私模式忽略 */ }
+})();
+</script>
+</head>
+<body>
+<header id="nav" class="nav hidden">
+  <a class="brand" href="#/dashboard"><span class="logo">B</span><span class="brand-text">币安量化终端</span></a>
+  <nav class="nav-links">
+    <a href="#/dashboard" data-route="dashboard">概览</a>
+    <a href="#/robots" data-route="robots">机器人</a>
+    <a href="#/account" data-route="account">账户</a>
+    <a href="#/apikeys" data-route="apikeys">API Key</a>
+  </nav>
+  <div class="nav-user">
+    <div class="seg seg-theme" id="themeSeg" role="group" aria-label="界面主题">
+      <button class="seg-btn" data-theme-btn="dark" type="button">深色</button>
+      <button class="seg-btn" data-theme-btn="light" type="button">浅色</button>
+      <button class="seg-btn" data-theme-btn="blue" type="button">冷蓝</button>
+      <button class="seg-btn" data-theme-btn="warm" type="button">暖色</button>
+    </div>
+    <span id="navUser" class="nav-username"></span>
+    <button id="logoutBtn" class="btn btn-ghost btn-sm" type="button">退出</button>
+  </div>
+</header>
+<main id="app"></main>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="modalRoot"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
