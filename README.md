@@ -70,36 +70,50 @@ $env:PORT=9000; node server.js
 
 | 参数 | 含义 | 默认 |
 |---|---|---|
-| `direction` | `dual` 双边 / `long` 仅做多 | `dual` |
-| `k` | 首层保证金占权益比例 | 1% |
+| `direction` | `dual` 双向 / `long` 只做多 / `short` 只做空 | `dual` |
+| `allocatedCapital` | **分配给这个机器人的资金（USDT）** | 100 |
+| `firstPct` | 第一笔保证金占「分配资金」的比例 | 1% |
 | `leverage` | 杠杆 | 20x |
-| `kMax` | 总名义 / 权益 上限 | 3.0 |
-| `dMax` | 满仓最大浮亏占权益比例 | 35% |
-| `beta` | 网格间距 = β × ATR | 0.4 |
-| `trendGateAtr` | 趋势闸门（× ATR） | 2 |
-| `maxLayers` | 层数硬上限 | 10 |
-| `tpMode` | 单层止盈 / 均价止盈 | 单层 |
-| `stopAtr` | 硬止损 = 末层 − stopAtr × ATR | 2 |
-| `interval` | 决策周期 | 1h |
-| `initialCapital` | 模拟初始资金 | 100 USDT |
+| `growRatio` | 每加一次仓，金额是上一次的几倍 | 1.5 |
+| `spacingPct` | 加仓间距（价格相对实际均价走多少 % 加一次） | 1% |
+| `maxLayers` | 最多加仓几笔（上限，不是一开始就建满） | 6 |
+| `totalPct` | 单方向名义 / 分配资金 上限 | 3.0 |
+| `maxLossPct` | 跌到止损位时的亏损 / 分配资金 上限 | 35% |
+| `tpMode` | `avg` 整体止盈 / `layer` 逐笔止盈 | `avg` |
+| `tpPct` | 止盈幅度（相对当前实际均价） | 0.5% |
+| `stopPct` | 止损幅度（相对当前实际均价） | 5% |
+| `interval` | 决策周期 | 5m |
+
+**为什么有 `allocatedCapital`（问题 #3）**：一个账户可以开多个机器人，如果每个机器人都按账户总权益算仓位，账户资金会被重复分配，多开一个就多一份爆仓风险。所以每个机器人只能动用「分配给它的资金」：
+
+- 仓位尺寸全部按 `allocatedCapital` 算，不按账户权益；
+- **累计占用闸**：开首笔和每次加仓前都校验「本机器人已占用保证金 + 本笔 ≤ allocatedCapital」，超了就拒绝并写一条事件；
+- 账户钱包（模拟盘）仍是共享的，`availableBalance = 钱包余额 − 所有机器人已占用`，只是每个机器人自己的上限是它的分配资金。
+
+**最小名义校验（问题 #4）**：币安要求单笔名义 ≥ 5 USDT。创建/预览时如果 `allocatedCapital × firstPct% × leverage < 5`，直接判「参数不可行」并给出中文原因，不会等到下单才报 -1111。
 
 求解链：
 
-1. `间距 g = clamp(β × ATR, 最小跳动, 3%)`
-2. `首层保证金 m1 = k × 权益`，`首层名义 = m1 × leverage`
-3. 公比 `r` 由等比数列求和反解：`(rⁿ−1)/(r−1) = kMax / (k × leverage)`
-4. 层数 `n` 取满足三条约束的**最大**整数：总名义 ≤ `kMax × 权益`；满仓浮亏 ≤ `dMax × 权益`；估算强平价 ≤ 末层价 × (1 − 2×ATR)
-5. 各层名义 `= m1 × leverage × rⁱ`
-6. 止盈：单层模式为该层入场价 × (1+g)；均价模式为满仓均价 × (1+g)
-7. 止损：`max(末层价 × (1 − stopAtr×ATR), 估算强平价 × 1.15)`
+1. `资金基数 capital = allocatedCapital`（缺失才回退账户权益）
+2. `首笔保证金 m1 = capital × firstPct%`，`首笔名义 = m1 × leverage`
+3. 各层名义 `= 首笔名义 × growRatioⁱ`
+4. 层数 `n` 从 `maxLayers` 往下试，取第一个满足三条约束的：单方向名义 ≤ `totalPct × capital`；跌到止损位亏损 ≤ `maxLossPct% × capital`；止损价必须在强平价之前触发
+5. **价格锚点 `anchorPrice`**：计划一旦生成就固定，之后阶梯触发价不再随行情漂移（问题 #7）。完全平仓后才重新取锚点。
+6. **止盈价永远按「当前实际持仓均价」现算**：`均价 × (1 ± tpPct%)`。绝不用「加满后的预测均价」，否则只开 1 笔时止盈价会落在现价错误一侧，开仓即平。
+7. **止损价**：`stopPct` 幅度价与「强平价留 20% 缓冲」取更早触发的那个，并强制夹在入场价与强平价之间（`safeStop`）。
 
-`direction = dual` 时，空头腿是多头腿的**完整镜像**，参与同一套约束判定：
+`direction = dual` 时，空头腿是多头腿的**完整镜像**：空头各层触发价 `= 锚点 × (1+spacing)ⁱ`，止盈 `= 空头实际均价 × (1 − tpPct%)`，止损在入场价上方、强平价下方。
 
-- 空头各层入场价 `= 现价 × (1+g)ⁱ`（价格向上时逐层加空），名义金额与多头同层相同。
-- 空头止盈 `= 该层入场价 × (1−g)`，空头止损 `= min(末层价 × (1 + stopAtr×ATR), 估算强平价 ÷ 1.15)`。
-- 三条约束取两腿中**更差**的一侧：`max(多头止损浮亏, 空头止损浮亏) ≤ dMax × 权益`，且两侧强平价都必须离各自末层至少 2×ATR。
+> 早期版本只算了多头腿，空头误用多头的止损价，导致空单一开仓就被判定为触发止损、反复开平。该问题已修复。
 
-> 早期版本只算了多头腿，空头误用多头的止损价，导致空单一开仓就被判定为触发止损、反复开平。该问题已修复（solver 输出 `stopPriceShort / tpPriceShort / liqPriceShort`，engine 按方向取对应值）。
+### 实盘的止盈止损是真挂单（问题 #10）
+
+实盘机器人每次 tick 都会用 `placeConditional` 在币安上挂 **TAKE_PROFIT_MARKET / STOP_MARKET** 条件单（`workingType=MARK_PRICE`），并维护 `state_json.condOrders` 记录自己挂出的单：
+
+- 数量只填**机器人自己那一份**，不用 `closePosition`，绝不误平用户手动仓；
+- `clientOrderId` 由「侧 + 类型 + 触发价 + 数量」派生，同样的意图永远同一个 id，网络超时重发会被币安按重复 id 拒掉；
+- 触发价或数量变了就换新 id，先撤旧单再挂新单；
+- 账户页「止盈价 / 止损价」两列在实盘下**直接读币安真实挂单**，没挂就显示「—」，估算值会标「估算」。
 
 **强平价是近似估算**，实际以币安返回为准。上实盘前务必先用最小资金验证。
 
@@ -111,7 +125,7 @@ $env:PORT=9000; node server.js
 B:\biance_trae
 ├── server.js                  入口：装配路由、启动服务、恢复机器人
 ├── package.json
-├── CONTRACT.md                工程契约（接口与分工的唯一权威）
+├── DEPLOY.md                  服务器部署手册（systemd / Nginx / 备份）
 ├── data/
 │   ├── app.db                 SQLite 数据库（自动创建）
 │   └── master.key             加密主密钥（自动创建，请备份）
@@ -180,6 +194,25 @@ A：`src/static/` 下缺少前端文件，检查是否完整拷贝了项目。
 
 **Q：实盘账户页显示「未配置 API Key 或网络不可达」？**
 A：两种情况——(1) 还没在 API Key 页添加并验证密钥；(2) 本机网络访问不了币安域名（中国大陆常见）。平台会降级展示，不会崩溃。
+
+**Q：开实盘机器人报 `Parameter 'reduceonly' sent when not required`（-1106）？**
+A：双向持仓（Hedge Mode）下币安不允许平仓单带 `reduceOnly`，方向由 `positionSide` 决定。已修复：只有单边持仓模式（`positionSide=BOTH`）才传 `reduceOnly`。
+
+**Q：报 `Timestamp for this request is outside of the recvWindow`（-1021）或 `was 1000ms ahead of the server's time`？**
+A：本机时钟和币安服务器有偏差，走代理时偏差更容易放大。平台现在的处理：
+1. 启动时 `startTimeSync()` 每 60 秒（`BINANCE_TIME_SYNC_MS`）用 `/fapi/v1/time` 往返中点校准一次时钟偏移，所有签名请求的 `timestamp` 都用「本机时间 + 偏移量」；
+2. `recvWindow` 可通过 `BINANCE_RECV_WINDOW` 调大（默认 5000，最大 60000），代理链路慢时建议设 10000；
+3. 收到 -1021 / -1022 会**强制立刻重新对时**再重试一次。
+服务器上还建议 `chronyc tracking` 确认系统时间本身没有被虚机拖慢。
+
+**Q：报 `精度超出资产定义`（-1111 / -4164）？**
+A：数量小数位必须 ≤ 该交易对 `stepSize` 允许的位数。已修复：`live.js` 的 `fmtStep / fmtQty / fmtPrice` 会从 `exchangeInfo` 的 `LOT_SIZE / PRICE_FILTER` 推导小数位再 `toFixed`，不再固定 10 位。
+
+**Q：网络超时后会不会重复开仓（问题 #1）？**
+A：不会。三层保护：① 下单用**确定性 clientOrderId**（机器人+侧+层+动作+5 分钟桶），重发会被币安按重复 id 拒掉；② 网络错误/`-1007`/重复 id 时用 `queryOrder(origClientOrderId)` 回查真实结果，查到就当成功；③ POST 下单**绝不自动重试**，只有 GET 和撤单会重试。
+
+**Q：为什么我的手动仓没被机器人平掉？**
+A：这是设计。实盘机器人维护自己的 `liveLegs` 账本，平仓只平账本里那一份数量，数量列标「手动」的就是你自己开的仓。
 
 **Q：忘记密码？**
 A：直接删除 `data/app.db` 里对应的 `users` 记录，或整个删除 `data/` 重新初始化（**会清空所有机器人和历史**）。

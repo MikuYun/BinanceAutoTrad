@@ -17,6 +17,11 @@ sv3.txt
 # 含真实服务器 IP / root 账号的本机专属部署记录
 DEPLOY-SERVER.md
 
+# 个人开发过程文档：只留在本地，不进入仓库
+CHANGES.md
+CHANGES-V2.md
+CONTRACT.md
+
 # 构建产物与压缩包
 *.tar.gz
 *.tgz
