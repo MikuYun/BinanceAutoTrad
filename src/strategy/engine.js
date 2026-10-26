@@ -12,7 +12,7 @@
  *     ▲                   │                                          │
  *     └───(止盈/止损全平)──┴──────────────────────────────────────────┘
  */
-import { solvePlan, tpTargetFor, stopTargetFor, safeStop, liqPrice } from './solver.js';
+import { solvePlan, tpTargetFor, stopTargetFor, safeStop, liqPrice, minOrderNotional, canPlaceNotional } from './solver.js';
 import { paperExchange } from '../binance/paper.js';
 
 /** 读取某一方向当前的实际持仓摘要 */
@@ -104,10 +104,23 @@ export function decide(p) {
   }
 
   const tpMode = plan.tpMode;
-  // 最小名义：plan 已经按「rules 给的 → 交易所兜底 5U」算好了，直接用
-  const minNotional = Number(plan.minNotional) > 0
-    ? Number(plan.minNotional)
-    : (Number(rules.minNotional) || 0);
+  // 最小可下单名义：plan 已经按「rules 的 minNotional 与 minQty×stepSize 取大」算好了，直接用。
+  // （以前只看 minNotional，像 SKHYNIXUSDT 这种 minQty=0.01 的标的会被高估可行性）
+  const minNotional = Number(plan.minOrderNotional || plan.minNotional) > 0
+    ? Number(plan.minOrderNotional || plan.minNotional)
+    : minOrderNotional(markPrice, rules);
+
+  // 这个机器人「分配给自己的资金」以及「已经占用的保证金」。
+  // 用户问题 #3：多机器人共用一个账户，如果每个都按账户全额算，账户资金会被
+  // 重复分配，多开一个机器人就多一份爆仓风险。所以每笔新开/加仓都要先确认
+  // 「本机器人已占用 + 本笔 <= allocatedCapital」。
+  const capitalBudget = Number(plan.capital) > 0 ? Number(plan.capital) : Number(equity) || 0;
+  // 已占用保证金 = 各方向名义 / 杠杆。
+  // 注意不能直接读 leg.margin：实盘账本的 leg 是 runner 用成交回执拼出来的，
+  // 里面只有 qty/entryPrice，没有 margin 字段，读 margin 会恒为 0 → 预算闸永远不生效。
+  const lev = Math.max(1, Number(plan.leverage) || 1);
+  let ownUsedMargin = 0;
+  for (const side of sides) ownUsedMargin += Math.max(0, Number(states[side].notional) || 0) / lev;
 
   for (const side of sides) {
     const st = states[side];
@@ -116,8 +129,17 @@ export function decide(p) {
     /* ---------- 无持仓：建首层（只开 1 层，不预填） ---------- */
     if (!hasPosition) {
       const notional = plan.firstLayerNotional;
-      if (minNotional > 0 && notional < minNotional) {
-        notes.push(`${side} 第一笔名义 ${notional.toFixed(2)}U 低于最小下单额，跳过`);
+      if (minNotional > 0 && !canPlaceNotional(notional, markPrice, { ...rules, minNotional })) {
+        notes.push(`${side} 第一笔名义 ${notional.toFixed(2)}U 低于该标的的最小可下单金额 ${minNotional.toFixed(2)}U，跳过`);
+        continue;
+      }
+      // 预算闸：本机器人已占用的保证金 + 这一笔不能超过分配资金
+      const needFirst = notional / Math.max(1, plan.leverage);
+      if (capitalBudget > 0 && ownUsedMargin + needFirst > capitalBudget + 1e-9) {
+        notes.push(
+          `${side} 第一笔要占用保证金 ${needFirst.toFixed(2)}U，`
+            + `本机器人已占用 ${ownUsedMargin.toFixed(2)}U，超过分配资金 ${capitalBudget.toFixed(2)}U，跳过`,
+        );
         continue;
       }
       actions.push({
@@ -203,17 +225,17 @@ export function decide(p) {
     if (!shouldAdd) continue;
 
     const layerNotional = plan.firstLayerNotional * Math.pow(plan.growRatio, st.layers);
-    if (minNotional > 0 && layerNotional < minNotional) {
-      notes.push(`${side} 第 ${nextLayer} 笔名义 ${layerNotional.toFixed(2)}U 低于最小下单额，加仓停止`);
+    if (minNotional > 0 && !canPlaceNotional(layerNotional, markPrice, { ...rules, minNotional })) {
+      notes.push(`${side} 第 ${nextLayer} 笔名义 ${layerNotional.toFixed(2)}U 低于该标的的最小可下单金额 ${minNotional.toFixed(2)}U，加仓停止`);
       continue;
     }
     const newMargin = layerNotional / Math.max(1, plan.leverage);
-    // 加仓上限按「分配给这个机器人的资金」算，不是整个账户权益
-    const capitalLimit = Number(plan.capital) > 0 ? Number(plan.capital) : equity;
-    if (newMargin > capitalLimit) {
+    // 加仓上限按「分配给这个机器人的资金」累计算，不是整个账户权益、也不是单笔对比
+    const capitalLimit = capitalBudget > 0 ? capitalBudget : equity;
+    if (ownUsedMargin + newMargin > capitalLimit + 1e-9) {
       notes.push(
-        `${side} 第 ${nextLayer} 笔保证金 ${newMargin.toFixed(2)}U 超过分配资金 `
-          + `${capitalLimit.toFixed(2)}U，加仓停止`,
+        `${side} 第 ${nextLayer} 笔保证金 ${newMargin.toFixed(2)}U 加上已占用 `
+          + `${ownUsedMargin.toFixed(2)}U 超过分配资金 ${capitalLimit.toFixed(2)}U，加仓停止`,
       );
       continue;
     }

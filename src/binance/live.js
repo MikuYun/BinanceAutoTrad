@@ -11,61 +11,145 @@
  *      否则报 -1106 Parameter 'reduceonly' sent when not required；
  *   5. 本机网络可能完全不通 —— 所有方法都要给出可读错误，绝不静默吞掉。
  */
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import * as rest from './rest.js';
 import { BinanceError } from './rest.js';
+import { DATA_DIR } from '../config.js';
 
 /** 交易所规则缓存（symbol -> rules），10 分钟过期 */
 const rulesCache = new Map();
 const RULES_TTL = 10 * 60 * 1000;
+/** 落盘缓存：服务重启 + 币安暂时不通时，仍能用上次拉到的真实精度规则，避免退回兜底值再撞 -1111 */
+const RULES_DISK = join(DATA_DIR, 'rules-cache.json');
+let diskLoaded = false;
 
-function parseFilters(sym) {
+/** 完全取不到规则时的保守兜底（会被 precisionAttempts 的降精度重试兜住） */
+const HARDCODED_RULES = {
+  tickSize: 0.0001,
+  stepSize: 0.001,
+  minQty: 0.001,
+  minNotional: 5,
+  maxNotional: Infinity,
+  maxLeverage: 125,
+};
+
+/**
+ * 这个合约能不能交易。
+ *
+ * 历史 bug（2026-10-26，用户报 -1111 Precision is over the maximum defined for this asset）：
+ * 这里原来写的是「contractType 不是 PERPETUAL 就跳过」，但币安现在把股票 / 商品类合约
+ * 标成 TRADIFI_PERPETUAL（SKHYNIXUSDT、XAUUSDT、TSLAUSDT、SPCXUSDT…）。
+ * 于是这些标的被排除在 exchangeInfo 解析之外 → getRules 抛 NO_SYMBOL → 静默降级成兜底规则
+ * （stepSize 固定 0.001，3 位小数）→ 而它们真实 stepSize 是 0.01（2 位小数）
+ * → 下单数量多写一位小数 → 币安直接拒绝 -1111。
+ * 现在只排除有交割日的合约（CURRENT_QUARTER / NEXT_QUARTER），其余交易中的全部收录。
+ */
+export function isTradableSymbol(sym) {
+  const ct = String((sym && sym.contractType) || '').toUpperCase();
+  if (ct.includes('QUARTER') || ct === 'CURRENT' || ct === 'NEXT') return false;
+  const st = String((sym && sym.status) || 'TRADING').toUpperCase();
+  return st === 'TRADING';
+}
+
+/**
+ * 解析单个合约的过滤器。
+ *
+ * 必须同时看 LOT_SIZE 和 MARKET_LOT_SIZE：限价单按 LOT_SIZE 校验数量精度，
+ * 市价单按 MARKET_LOT_SIZE 校验，本平台开仓 / 平仓都用 MARKET，
+ * 两者步长不一致时取更粗的一档才能保证两种单都合法。
+ */
+export function parseFilters(sym) {
   const out = {
     symbol: sym.symbol,
     tickSize: 0,
     stepSize: 0,
+    marketStepSize: 0,
     minNotional: 0,
     maxNotional: Infinity,
     maxLeverage: 125,
     minQty: 0,
+    contractType: String(sym.contractType || ''),
   };
   for (const f of sym.filters || []) {
     if (f.filterType === 'PRICE_FILTER') out.tickSize = Number(f.tickSize) || 0;
     if (f.filterType === 'LOT_SIZE') {
       out.stepSize = Number(f.stepSize) || 0;
-      out.minQty = Number(f.minQty) || 0;
+      out.minQty = Math.max(out.minQty, Number(f.minQty) || 0);
+    }
+    if (f.filterType === 'MARKET_LOT_SIZE') {
+      out.marketStepSize = Number(f.stepSize) || 0;
+      out.minQty = Math.max(out.minQty, Number(f.minQty) || 0);
     }
     if (f.filterType === 'MIN_NOTIONAL') out.minNotional = Number(f.notional || f.minNotional) || 0;
     if (f.filterType === 'MAX_NUM_ORDERS') out.maxOrders = Number(f.limit) || 0;
   }
+  out.stepSize = Math.max(out.stepSize, out.marketStepSize);
   return out;
 }
 
+/** 从磁盘恢复规则缓存（只恢复有真实 stepSize 的条目） */
+function loadRulesDisk() {
+  if (diskLoaded) return;
+  diskLoaded = true;
+  try {
+    const data = JSON.parse(readFileSync(RULES_DISK, 'utf8'));
+    const at = Number(data && data.savedAt) || 0;
+    for (const [symbol, value] of Object.entries((data && data.rules) || {})) {
+      if (!value || !(Number(value.stepSize) > 0)) continue;
+      if (!rulesCache.has(symbol)) rulesCache.set(symbol, { value, at });
+    }
+  } catch {
+    // 没有缓存文件是正常情况（首次启动）
+  }
+}
+
+/** 把规则缓存写盘（失败不影响交易） */
+function saveRulesDisk() {
+  try {
+    const rules = {};
+    for (const [symbol, item] of rulesCache) rules[symbol] = item.value;
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(RULES_DISK, JSON.stringify({ savedAt: Date.now(), rules }), { mode: 0o600 });
+  } catch {
+    // 磁盘写失败只是少了重启兜底，不影响本次运行
+  }
+}
+
 /**
- * 取交易规则。带缓存，失败时返回保守默认值（BTCUSDT/HYPEUSDT 这类常见规格）。
+ * 取交易规则。
+ *
+ * 取值顺序：内存缓存 → 磁盘缓存 → 兜底常量。
+ * 兜底时返回 degraded:true，让上层能在事件里提示用户「现在用的是兜底精度」，
+ * 同时下单层还有 precisionAttempts 逐级降精度重试作为最后一道保险。
  */
 export async function getRules(symbol) {
+  loadRulesDisk();
   const cached = rulesCache.get(symbol);
   if (cached && Date.now() - cached.at < RULES_TTL) return cached.value;
   try {
     const info = await rest.exchangeInfo();
     for (const s of info.symbols || []) {
-      if (s.contractType && s.contractType !== 'PERPETUAL') continue;
+      if (!isTradableSymbol(s)) continue;
       const r = parseFilters(s);
       rulesCache.set(s.symbol, { value: r, at: Date.now() });
     }
     const hit = rulesCache.get(symbol);
-    if (hit) return hit.value;
+    if (hit) {
+      saveRulesDisk();
+      return hit.value;
+    }
     throw new BinanceError(`交易所没有该合约：${symbol}`, { code: 'NO_SYMBOL' });
   } catch (err) {
-    // 网络不通时用兜底规则，让模拟计划和实盘页面仍能渲染
+    // 拉不到新规则时，优先用缓存里的真实规则（过期也照用），绝不再退回 0.001 兜底去撞 -1111
+    if (cached && Number(cached.value.stepSize) > 0) return { ...cached.value, stale: true };
+    const fromDisk = rulesCache.get(symbol);
+    if (fromDisk && Number(fromDisk.value.stepSize) > 0) {
+      return { ...fromDisk.value, stale: true, error: (err && err.message) || String(err) };
+    }
     return {
+      ...HARDCODED_RULES,
       symbol,
-      tickSize: 0.0001,
-      stepSize: 0.001,
-      minQty: 0.001,
-      minNotional: 5,
-      maxNotional: Infinity,
-      maxLeverage: 125,
       degraded: true,
       error: (err && err.message) || String(err),
     };
@@ -124,6 +208,46 @@ export function fmtStep(value, step, mode = 'floor') {
 export function fmtQty(qty, rules) {
   const step = (rules && rules.stepSize) || 0.001;
   return fmtStep(qty, step, 'floor');
+}
+
+/**
+ * 数量候选串：第 0 档用真实 stepSize，之后每档把 step 放大 10 倍（小数位少 1 位），最多 4 档。
+ *
+ * 币安对「数量小数位超过该资产 stepSize」的订单直接拒绝（-1111），
+ * 被拒的订单根本没进撮合，所以放宽小数位后重发是安全的，不会造成重复开仓。
+ */
+export function qtyCandidates(qty, rules, refPrice = 0, minNotional = 0) {
+  const step = Number((rules && rules.stepSize) || 0) || 0.001;
+  const out = [];
+  let s = step;
+  for (let i = 0; i < 4; i += 1) {
+    const str = fmtStep(qty, s, 'floor');
+    const n = Number(str);
+    if (n > 0 && !out.includes(str)) {
+      // 更粗的 step 只会让数量更小，名义如果已经不够最小下单额，后面的档位更不可能过
+      if (minNotional > 0 && refPrice > 0 && n * refPrice < minNotional * 0.999999) break;
+      out.push(str);
+    }
+    s *= 10;
+  }
+  return out;
+}
+
+/**
+ * 条件单（止盈 / 止损）的精度候选：数量降精度 + 触发价 tick 放宽，同步逐档尝试。
+ */
+export function precisionAttempts(rules, { qty, triggerPrice } = {}) {
+  const step = Number((rules && rules.stepSize) || 0) || 0.001;
+  const tick = Number((rules && rules.tickSize) || 0) || 0.0001;
+  const out = [];
+  for (let i = 0; i < 4; i += 1) {
+    const quantity = qty == null ? null : fmtStep(qty, step * 10 ** i, 'floor');
+    const stopPrice = triggerPrice == null ? null : fmtStep(triggerPrice, tick * 10 ** i, 'round');
+    if (quantity != null && !(Number(quantity) > 0)) continue;
+    const key = `${quantity}|${stopPrice}`;
+    if (!out.some((x) => `${x.quantity}|${x.stopPrice}` === key)) out.push({ quantity, stopPrice });
+  }
+  return out;
 }
 
 /** 价格按 tickSize 规整后的字符串 */
@@ -235,6 +359,14 @@ function isDuplicateError(err) {
   return c === -4015 || c === -4116 || c === -2021 || c === -2010;
 }
 
+/** 判断是否「精度超限」（-1111 / -4164）——这类错误说明订单根本没被接受，可以降精度后重发 */
+function isPrecisionError(err) {
+  const c = err && err.binanceCode;
+  if (c === -1111 || c === -4164) return true;
+  const msg = String((err && err.message) || '');
+  return /precision is over the maximum|too many decimal places/i.test(msg);
+}
+
 /** 判断是否「订单不存在」 */
 function isNotExistError(err) {
   return Boolean(err && err.binanceCode === -2013);
@@ -269,60 +401,76 @@ async function recoverByClientId(credentials, symbol, clientOrderId, times = 3) 
 export async function placeOrder(credentials, spec) {
   const { symbol, side, positionSide, type = 'MARKET', quantity, price, rules } = spec;
 
-  // 数量按交易所 stepSize 规整，并按该 step 的小数位输出（修 -1111 精度错误）
-  const qtyStr = fmtQty(quantity, rules);
-  const qty = Number(qtyStr);
-  if (!(qty > 0)) {
+  const refPrice = Number(price) || 0;
+  const minNotional = (rules && rules.minNotional) || 5;
+
+  // 数量备选串：第 1 个用真实 stepSize，后面每档小数位少 1 位。
+  // 只用于撞上 -1111 时降精度重发（订单未被接受，重发安全）。
+  // closePosition=true 时订单不带 quantity，降精度没有意义，只发一次。
+  const qtyList = spec.closePosition
+    ? [null]
+    : qtyCandidates(quantity, rules, refPrice, minNotional);
+  if (!qtyList.length) {
     throw new BinanceError(
       `数量 ${quantity} 按最小步长 ${(rules && rules.stepSize) || 0.001} 规整后为 0，无法下单`,
       { code: 'QTY_TOO_SMALL' },
     );
   }
 
-  const refPrice = Number(price) || 0;
-  const notional = qty * refPrice;
-  const minNotional = (rules && rules.minNotional) || 5;
-  if (refPrice > 0 && notional > 0 && notional < minNotional) {
-    throw new BinanceError(
-      `名义 ${notional.toFixed(4)}U 低于交易所最小下单额 ${minNotional}U`,
-      { code: 'BELOW_MIN_NOTIONAL' },
-    );
+  if (!spec.closePosition) {
+    const baseQty = Number(qtyList[0]);
+    const notional = baseQty * refPrice;
+    if (refPrice > 0 && notional > 0 && notional < minNotional) {
+      throw new BinanceError(
+        `名义 ${notional.toFixed(4)}U 低于交易所最小下单额 ${minNotional}U`,
+        { code: 'BELOW_MIN_NOTIONAL' },
+      );
+    }
   }
 
-  const form = { symbol, side, type, quantity: qtyStr };
-  if (positionSide) form.positionSide = positionSide;
-  if (type === 'LIMIT') {
-    form.price = fmtPrice(price, rules);
-    form.timeInForce = 'GTC';
-  }
-  if (spec.closePosition) {
-    // closePosition=true 时不能带 quantity
-    form.closePosition = 'true';
-    delete form.quantity;
-  } else if (spec.reduceOnly && (!positionSide || positionSide === 'BOTH')) {
-    // 双向持仓模式下传 reduceOnly 会被币安直接拒绝（-1106），只有单向持仓才需要
-    form.reduceOnly = 'true';
-  }
-  if (spec.clientOrderId) form.newClientOrderId = spec.clientOrderId;
+  let lastPrecisionErr = null;
+  for (const qtyStr of qtyList) {
+    const form = { symbol, side, type };
+    if (qtyStr != null) form.quantity = qtyStr;
+    if (positionSide) form.positionSide = positionSide;
+    if (type === 'LIMIT') {
+      form.price = fmtPrice(price, rules);
+      form.timeInForce = 'GTC';
+    }
+    if (spec.closePosition) {
+      // closePosition=true 时不能带 quantity
+      form.closePosition = 'true';
+    } else if (spec.reduceOnly && (!positionSide || positionSide === 'BOTH')) {
+      // 双向持仓模式下传 reduceOnly 会被币安直接拒绝（-1106），只有单向持仓才需要
+      form.reduceOnly = 'true';
+    }
+    if (spec.clientOrderId) form.newClientOrderId = spec.clientOrderId;
 
-  try {
-    return await rest.newOrder(credentials, form);
-  } catch (err) {
-    // 重复提交：说明这笔其实已经在交易所了，回查拿真实状态
-    if (isDuplicateError(err) && spec.clientOrderId) {
-      const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
-      if (found) return { ...found, _recovered: 'duplicate' };
+    try {
+      return await rest.newOrder(credentials, form);
+    } catch (err) {
+      // 精度超限：换一个更粗的数量重发（币安未接受此单，不会重复开仓）
+      if (isPrecisionError(err)) {
+        lastPrecisionErr = err;
+        continue;
+      }
+      // 重复提交：说明这笔其实已经在交易所了，回查拿真实状态
+      if (isDuplicateError(err) && spec.clientOrderId) {
+        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        if (found) return { ...found, _recovered: 'duplicate' };
+        throw err;
+      }
+      // 网络超时 / 网关错误：不能假设没成交，必须按 clientOrderId 回查
+      if ((err && err.network) || (err && err.binanceCode === -1007)) {
+        if (!spec.clientOrderId) throw err;
+        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        if (found) return { ...found, _recovered: 'timeout' };
+        return null; // 确认没下成，调用方可以安全重试
+      }
       throw err;
     }
-    // 网络超时 / 网关错误：不能假设没成交，必须按 clientOrderId 回查
-    if ((err && err.network) || (err && err.binanceCode === -1007)) {
-      if (!spec.clientOrderId) throw err;
-      const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
-      if (found) return { ...found, _recovered: 'timeout' };
-      return null; // 确认没下成，调用方可以安全重试
-    }
-    throw err;
   }
+  throw lastPrecisionErr || new BinanceError('下单失败：精度调整后仍被拒绝', { code: 'PRECISION_FAILED' });
 }
 
 /**
@@ -340,32 +488,50 @@ export async function placeConditional(credentials, spec) {
   const { symbol, side, type, triggerPrice, quantity, rules } = spec;
   const isLong = side === 'long';
   const orderType = type === 'tp' ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
-  // 平多 = SELL + positionSide LONG；平空 = BUY + positionSide SHORT
-  const form = {
-    symbol,
-    side: isLong ? 'SELL' : 'BUY',
-    positionSide: isLong ? 'LONG' : 'SHORT',
-    type: orderType,
-    stopPrice: fmtPrice(triggerPrice, rules),
-    workingType: 'MARK_PRICE',
-    quantity: fmtQty(quantity, rules),
-  };
-  if (spec.clientOrderId) form.newClientOrderId = spec.clientOrderId;
-  try {
-    return await rest.newOrder(credentials, form);
-  } catch (err) {
-    if (isDuplicateError(err) && spec.clientOrderId) {
-      const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
-      if (found) return { ...found, _recovered: 'duplicate' };
-    }
-    if ((err && err.network) || (err && err.binanceCode === -1007)) {
-      if (!spec.clientOrderId) throw err;
-      const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
-      if (found) return { ...found, _recovered: 'timeout' };
-      return null;
-    }
-    throw err;
+
+  // 数量 + 触发价双降精度档位：撞 -1111 时逐档退，直到币安接受
+  const attempts = precisionAttempts(rules, { qty: quantity, triggerPrice });
+  if (!attempts.length) {
+    throw new BinanceError(
+      `条件单数量 ${quantity} 按最小步长 ${(rules && rules.stepSize) || 0.001} 规整后为 0，无法下单`,
+      { code: 'QTY_TOO_SMALL' },
+    );
   }
+
+  let lastPrecisionErr = null;
+  for (const attempt of attempts) {
+    // 平多 = SELL + positionSide LONG；平空 = BUY + positionSide SHORT
+    const form = {
+      symbol,
+      side: isLong ? 'SELL' : 'BUY',
+      positionSide: isLong ? 'LONG' : 'SHORT',
+      type: orderType,
+      stopPrice: attempt.stopPrice,
+      workingType: 'MARK_PRICE',
+      quantity: attempt.quantity,
+    };
+    if (spec.clientOrderId) form.newClientOrderId = spec.clientOrderId;
+    try {
+      return await rest.newOrder(credentials, form);
+    } catch (err) {
+      if (isPrecisionError(err)) {
+        lastPrecisionErr = err;
+        continue;
+      }
+      if (isDuplicateError(err) && spec.clientOrderId) {
+        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        if (found) return { ...found, _recovered: 'duplicate' };
+      }
+      if ((err && err.network) || (err && err.binanceCode === -1007)) {
+        if (!spec.clientOrderId) throw err;
+        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        if (found) return { ...found, _recovered: 'timeout' };
+        return null;
+      }
+      throw err;
+    }
+  }
+  throw lastPrecisionErr || new BinanceError('条件单挂单失败：精度调整后仍被拒绝', { code: 'PRECISION_FAILED' });
 }
 
 /** 撤单（支持按 exchange orderId，或按 clientOrderId） */

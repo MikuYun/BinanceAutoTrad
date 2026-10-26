@@ -41,6 +41,35 @@ async function loadMarket() {
   }
 }
 
+/**
+ * 取该合约的真实精度规则（tickSize / stepSize / minNotional）。
+ *
+ * 历史 bug（2026-10-26）：预览与详情页写死了 {stepSize:0.001, tickSize:0.0001}，
+ * 而 BNBUSDT / 股票类合约真实 stepSize 是 0.01 —— 预览算出来的数量比交易所允许的
+ * 多一位小数，实盘一下单就被 -1111 拒绝。所以这里必须走真实的 exchangeInfo。
+ * 拿不到时退回兜底值（页面仍能渲染），并标记 degraded。
+ */
+const FALLBACK_RULES = {
+  minQty: 0.001,
+  stepSize: 0.001,
+  tickSize: 0.0001,
+  minNotional: 5,
+  maxNotional: Infinity,
+  maxLeverage: 125,
+  degraded: true,
+};
+
+async function loadRules(symbol) {
+  try {
+    const { getRules } = await import('../binance/live.js');
+    const r = await getRules(symbol);
+    if (r && Number(r.stepSize) > 0) return r;
+    return FALLBACK_RULES;
+  } catch {
+    return FALLBACK_RULES;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * 工具函数
  * ------------------------------------------------------------------ */
@@ -186,11 +215,6 @@ export default function registerRobots(app) {
       ? paramsMod.normalizeParams(rawParams || {})
       : rawParams || {};
 
-    const check = paramsMod.validateParams ? paramsMod.validateParams(normalized) : { ok: true, errors: [] };
-    if (!check.ok) {
-      throw new HttpError(400, 'BAD_PARAMS', (check.errors || []).join('；') || '参数不合法');
-    }
-
     const feed = await loadMarket();
     // 优先用异步 ATR（真实币安 K 线计算），失败再回退同步缓存/兜底值
     let atrPct = 0.02;
@@ -203,6 +227,25 @@ export default function registerRobots(app) {
     }
     const price = feed ? safe(() => feed.getPrice(symbol), 0) : 0;
 
+    // 用真实的交易所规则（stepSize 等），否则预览数量精度会与实盘对不上
+    const rules = mode === 'live'
+      ? await loadRules(symbol)
+      : { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 };
+
+    // 参数校验必须带上「真实数量规则 + 现价」：否则像 SKHYNIXUSDT 这种
+    // minQty=0.01 的标的，第一笔名义明明不够一个最小单位却会被判可行。
+    const check = paramsMod.validateParams
+      ? paramsMod.validateParams(normalized, {
+        minNotional: rules.minNotional,
+        minQty: rules.minQty,
+        stepSize: rules.stepSize,
+        price,
+      })
+      : { ok: true, errors: [] };
+    if (!check.ok) {
+      throw new HttpError(400, 'BAD_PARAMS', (check.errors || []).join('；') || '参数不合法');
+    }
+
     // 预览用的权益：优先前端传入；模拟盘读账户钱包余额；没有钱包再用参数兜底
     let equity = Number(rawEquity);
     if (!Number.isFinite(equity) || equity <= 0) {
@@ -214,7 +257,6 @@ export default function registerRobots(app) {
       }
     }
 
-    const rules = { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 };
     const plan = solver.solvePlan({
       equity,
       atrPct,
@@ -282,7 +324,10 @@ export default function registerRobots(app) {
         // 否则详情页的触发价/均价/止盈止损会跟着实时价一直漂。
         anchorPrice: Number((state && state.anchorPrice) || 0) || 0,
         params: robot.params,
-        rules: { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 },
+        // 实盘用交易所真实规则；模拟盘保持原有简单规则
+        rules: robot.mode === 'live'
+          ? await loadRules(row.symbol)
+          : { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 },
         direction: robot.params.direction || 'dual',
       });
       layers = solver.solveLayers ? solver.solveLayers(plan) : [];
@@ -333,7 +378,21 @@ export default function registerRobots(app) {
     const params = paramsMod.normalizeParams
       ? paramsMod.normalizeParams(body.params || {})
       : body.params || {};
-    const check = paramsMod.validateParams ? paramsMod.validateParams(params) : { ok: true, errors: [] };
+
+    // 新建时也要按「真实数量规则 + 现价」校验：否则能建出一个永远开不了仓的机器人
+    const rules = mode === 'live'
+      ? await loadRules(symbol)
+      : { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 };
+    const feed = await loadMarket();
+    const price = feed ? safe(() => feed.getPrice(symbol), 0) : 0;
+    const check = paramsMod.validateParams
+      ? paramsMod.validateParams(params, {
+        minNotional: rules.minNotional,
+        minQty: rules.minQty,
+        stepSize: rules.stepSize,
+        price,
+      })
+      : { ok: true, errors: [] };
     if (!check.ok) {
       throw new HttpError(400, 'BAD_PARAMS', (check.errors || []).join('；') || '参数不合法');
     }
@@ -389,7 +448,20 @@ export default function registerRobots(app) {
       const params = paramsMod.normalizeParams
         ? paramsMod.normalizeParams(body.params || {})
         : body.params || {};
-      const check = paramsMod.validateParams ? paramsMod.validateParams(params) : { ok: true, errors: [] };
+      // 改参数同样按真实数量规则校验，避免存进一个开不了仓的配置
+      const rules = row.mode === 'live'
+        ? await loadRules(row.symbol)
+        : { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 };
+      const feed = await loadMarket();
+      const price = feed ? safe(() => feed.getPrice(row.symbol), 0) : 0;
+      const check = paramsMod.validateParams
+        ? paramsMod.validateParams(params, {
+          minNotional: rules.minNotional,
+          minQty: rules.minQty,
+          stepSize: rules.stepSize,
+          price,
+        })
+        : { ok: true, errors: [] };
       if (!check.ok) {
         throw new HttpError(400, 'BAD_PARAMS', (check.errors || []).join('；') || '参数不合法');
       }

@@ -313,9 +313,15 @@ export function ping() {
   return publicGet('/fapi/v1/ping', {});
 }
 
-/** 交易规则 */
-export function exchangeInfo() {
-  return publicGet('/fapi/v1/exchangeInfo', {});
+/**
+ * 交易规则。
+ *
+ * exchangeInfo 是币安最大的公开响应（约 1.1MB、1000+ 合约），走代理时经常比普通
+ * 接口慢好几倍。用默认 8s/20s 阈值容易判成超时，一超时就退回兜底规则 → 精度不对
+ * → -1111。所以这里单独给一个更长的超时。
+ */
+export function exchangeInfo(timeoutMs) {
+  return publicGet('/fapi/v1/exchangeInfo', {}, timeoutMs || Math.max(BINANCE.timeoutMs || 8000, 30000));
 }
 
 /** 24h ticker */

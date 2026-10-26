@@ -30,6 +30,70 @@ const LIQ_BUFFER = 0.2; // 止损价与强平价之间的安全间距（占 entr
 /** 交易所最小名义兜底（U 本位永续 5U）。live.js 会从 exchangeInfo 取真实值。 */
 export const DEFAULT_MIN_NOTIONAL = 5;
 
+/* ===================== 最小可下单量（stepSize / minQty） =====================
+ *
+ * 只校验 minNotional 是不够的。以 SKHYNIXUSDT 为例：
+ *   minNotional = 5U，但 minQty = 0.01、stepSize = 0.01、价格 975
+ *   → 数量 0.01 个 = 名义 9.75U，也就是说 **低于 9.75U 的单根本下不出去**。
+ *
+ * 旧逻辑只看 5U，于是「第一笔名义 6U」会被判成可行，实际下单时
+ * qty = 6/975 = 0.006154，按 stepSize 0.01 向下取整变成 0.00，
+ * 直接被交易所拒绝（QTY_TOO_SMALL）。
+ *
+ * 下面三个函数把「数量」和「名义」的换算是同一套：先算出交易所要求的
+ * 最小整数单位数，再用它反推最小名义。
+ */
+
+/** 交易所要求的最小数量整数单位（按 stepSize 对齐后的最小台阶数） */
+export function requiredQtyUnits(rules = {}) {
+  const minQty = Number(rules.minQty) > 0 ? Number(rules.minQty) : 0;
+  const step = Number(rules.stepSize) > 0 ? Number(rules.stepSize) : 0;
+  if (step > 0 && minQty > 0) return Math.max(1, Math.ceil(minQty / step - 1e-9));
+  if (minQty > 0) return 1;
+  return 0;
+}
+
+/** 给定名义金额和价格，算出实际能下出去的数量单位数（与 fmtQty 的向下取整一致） */
+export function qtyUnitsOf(notional, price, rules = {}) {
+  const n = Number(notional) > 0 ? Number(notional) : 0;
+  const p = Number(price) > 0 ? Number(price) : 0;
+  if (!(n > 0) || !(p > 0)) return 0;
+  const rawQty = n / p;
+  const step = Number(rules.stepSize) > 0 ? Number(rules.stepSize) : 0;
+  if (step > 0) return Math.max(0, Math.floor(rawQty / step + 1e-9));
+  // 没有 stepSize 信息时按 8 位小数兜底（与 fmtStep 的默认精度一致）
+  return Math.max(0, Math.floor(rawQty * 1e8 + 1e-9));
+}
+
+/**
+ * 该合约在该价格下的「真正最小可下单名义」。
+ * = max(交易所 minNotional, 最小数量单位 × stepSize × 价格)
+ */
+export function minOrderNotional(price, rules = {}) {
+  const p = Number(price) > 0 ? Number(price) : 0;
+  const rawMin = Number(rules.minNotional) > 0 ? Number(rules.minNotional) : DEFAULT_MIN_NOTIONAL;
+  const need = requiredQtyUnits(rules);
+  const step = Number(rules.stepSize) > 0 ? Number(rules.stepSize) : 0;
+  if (!(p > 0) || need <= 0 || step <= 0) return rawMin;
+  let n = need * step * p;
+  // 浮点向下取整可能刚好掉一个单位，补一点点余量（对资金的影响可忽略）
+  let guard = 0;
+  while (qtyUnitsOf(n, p, rules) < need && guard < 64) {
+    n += step * p * 1e-6;
+    guard += 1;
+  }
+  return Math.max(rawMin, n);
+}
+
+/** 这个名义金额在该价格下能不能真的下出去（同时满足 minNotional 与 minQty/stepSize） */
+export function canPlaceNotional(notional, price, rules = {}) {
+  const rawMin = Number(rules.minNotional) > 0 ? Number(rules.minNotional) : DEFAULT_MIN_NOTIONAL;
+  if (!(Number(notional) >= rawMin * (1 - 1e-9))) return false;
+  const need = requiredQtyUnits(rules);
+  if (need <= 0) return true;
+  return qtyUnitsOf(notional, price, rules) >= need;
+}
+
 /**
  * 全仓强平价（近似）。
  *
@@ -193,9 +257,12 @@ export function solvePlan(input) {
   const tpPct = Number(params.tpPct) > 0 ? Number(params.tpPct) : 0.5;
   const stopPct = Number(params.stopPct) > 0 ? Number(params.stopPct) : 5;
   const tpMode = params.tpMode === 'layer' ? 'layer' : 'avg';
-  const minNotional = Number(rules.minNotional) > 0
+  const rawMinNotional = Number(rules.minNotional) > 0
     ? Number(rules.minNotional)
     : DEFAULT_MIN_NOTIONAL;
+  // 真正能下出去的最小名义：同时受 minNotional 与 minQty/stepSize 约束。
+  // 例：SKHYNIXUSDT 价格 975、minQty 0.01、stepSize 0.01 → 最小名义 9.75U > 5U。
+  const minNotional = minOrderNotional(price, rules);
 
   // 资金基数：机器人只被授权动用「分配给自己的资金」。
   // 只有未配置（<=0 或缺失）时才回退到账户权益，保证老机器人还能跑。
@@ -232,7 +299,9 @@ export function solvePlan(input) {
     firstLayerMargin: round6(firstMargin),
     firstMarginUsd: round6(firstMargin),
     firstLayerNotional: round6(firstNotional),
-    minNotional,
+    minNotional: round6(minNotional),
+    rawMinNotional,
+    minOrderNotional: round6(minNotional),
     currentLayers: Math.max(0, Math.round(Number(currentLayers) || 0)),
     notes,
     layerList: [],
@@ -243,9 +312,17 @@ export function solvePlan(input) {
     return base;
   }
   if (firstNotional < minNotional) {
+    const byQty = minNotional > rawMinNotional + 1e-9;
+    const tipPct = capital > 0 ? (minNotional / (leverage * capital)) * 100 : 0;
     notes.push(
-      `第一笔金额太小：名义 ${firstNotional.toFixed(2)}U，低于交易所最小下单额 ${minNotional}U。`
-        + '请把「分配给这个机器人的资金」或「第一笔保证金占比」调大。',
+      `第一笔金额太小：名义 ${firstNotional.toFixed(2)}U，低于该标的的最小可下单金额 ${minNotional.toFixed(2)}U`
+        + (byQty
+          ? `（交易所要求最少 ${Number(rules.minQty).toFixed(4)} 个 / 每次加减 ${Number(rules.stepSize).toFixed(4)} 个，按现价 ${price.toFixed(2)} 算就是 ${minNotional.toFixed(2)}U）`
+          : `（交易所最小下单额 ${rawMinNotional.toFixed(2)}U）`)
+        + '。'
+        + `把「第一笔保证金占分配资金的比例」调到 ${Math.min(100, Math.ceil(tipPct * 100) / 100).toFixed(2)}% 以上，`
+        + `或把「分配给这个机器人的资金」调到 ${((minNotional / leverage) / (firstPct / 100)).toFixed(0)}U 以上，`
+        + '或提高杠杆。',
     );
     return base;
   }
@@ -354,7 +431,7 @@ export function solvePlan(input) {
       tpPrice: round6(tpL),
       tpPriceShort: round6(tpS),
       shortTpPrice: round6(tpS),
-      belowMinNotional: lg.notional < minNotional,
+      belowMinNotional: !canPlaceNotional(lg.notional, price, rules),
     };
   });
 

@@ -163,6 +163,7 @@ async function tick(entry) {
 
   const exchange = getExchange(mode);
   const rules = mode === 'live' ? await getLiveRules(symbol) : PAPER_RULES;
+  if (mode === 'live') warnDegradedRules(userId, robotId, symbol, rules);
 
   let book = null;
   let legs = null; // 实盘：机器人自己的持仓账本（与用户手动仓隔离）
@@ -661,7 +662,14 @@ async function tick(entry) {
   saveRobot(robotId, patch);
 }
 
-/** 实盘规则（带缓存） */
+/**
+ * 实盘规则（带缓存）。
+ *
+ * live.js 的 getRules 自己会做三层取值：内存缓存 → data/rules-cache.json 磁盘缓存 →
+ * 最后的兜底常量（并标 degraded:true）。这里不再另加一层「失败就返回 PAPER_RULES」的
+ * 静默降级 —— 那个静默降级就是 -1111 精度错误的帮凶：PAPER_RULES 的 stepSize 固定 0.001，
+ * 而 BNBUSDT / 股票类合约真实是 0.01，多写一位小数币安直接拒单。
+ */
 const liveRulesCache = new Map();
 async function getLiveRules(symbol) {
   const hit = liveRulesCache.get(symbol);
@@ -669,7 +677,8 @@ async function getLiveRules(symbol) {
   try {
     const { getRules } = await import('../binance/live.js');
     const r = await getRules(symbol);
-    liveRulesCache.set(symbol, { value: r, at: Date.now() });
+    // 兜底规则不缓存，让它下次还能再试着拉真实值
+    if (r && !r.degraded) liveRulesCache.set(symbol, { value: r, at: Date.now() });
     return r;
   } catch {
     return PAPER_RULES;
@@ -677,6 +686,24 @@ async function getLiveRules(symbol) {
 }
 
 const PAPER_RULES = { minQty: 0.001, stepSize: 0.001, tickSize: 0.0001, minNotional: 5, maxLeverage: 125 };
+
+/**
+ * 实盘规则降级提示（节流：同一机器人 10 分钟内只提醒一次）。
+ */
+const degradedNotice = new Map();
+function warnDegradedRules(userId, robotId, symbol, rules) {
+  if (!rules || !rules.degraded) return;
+  const key = `${robotId}:${symbol}`;
+  const last = degradedNotice.get(key) || 0;
+  if (Date.now() - last < 600000) return;
+  degradedNotice.set(key, Date.now());
+  logEvent(
+    userId,
+    robotId,
+    'warn',
+    `取不到 ${symbol} 的交易所精度规则（${rules.error || '网络异常'}），暂时用兜底精度下单，数量可能被交易所拒绝。-1111 会自动降精度重试。`,
+  );
+}
 
 /* --- 旧的带时间戳 id 已弃用：换成 live.js 的确定性 makeClientId（防重复下单）--- */
 /* ------------------------------------------------------------------ *

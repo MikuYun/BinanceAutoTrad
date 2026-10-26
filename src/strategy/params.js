@@ -16,6 +16,8 @@
  *   initialCapital → allocatedCapital  旧机器人的本金就是「分配给它的资金」
  */
 
+import { minOrderNotional } from './solver.js';
+
 /** 参数 schema：前端表单直接按这个渲染 */
 export const PARAM_SCHEMA = [
   {
@@ -289,26 +291,43 @@ export function normalizeParams(raw) {
  * @param {object} params 原始参数（内部会先 normalize）
  * @param {object} [opts]
  * @param {number} [opts.minNotional] 交易所最小名义，缺省 5U
+ * @param {number} [opts.minQty]      交易所最小数量（如 SKHYNIXUSDT 是 0.01）
+ * @param {number} [opts.stepSize]    交易所数量步长
+ * @param {number} [opts.price]       当前价格；给了才能算出「最小数量值多少钱」
  */
 export function validateParams(params, opts = {}) {
   const p = normalizeParams(params);
   const errors = [];
   const warnings = [];
 
-  const minNotional = Number(opts.minNotional) > 0
+  const rawMinNotional = Number(opts.minNotional) > 0
     ? Number(opts.minNotional)
     : DEFAULT_MIN_NOTIONAL;
+  // 真正能下出去的最小名义：若知道价格和数量规则，把「最小数量 × 价格」也算进来。
+  // 例：SKHYNIXUSDT minQty 0.01、价格 975 → 最小名义 9.75U，而不是 5U。
+  const price = Number(opts.price) > 0 ? Number(opts.price) : 0;
+  const minNotional = price > 0
+    ? minOrderNotional(price, {
+      minNotional: rawMinNotional,
+      minQty: opts.minQty,
+      stepSize: opts.stepSize,
+    })
+    : rawMinNotional;
 
   const firstMargin = (p.allocatedCapital * p.firstPct) / 100;
   const firstNotional = firstMargin * p.leverage;
   const firstNotionalPct = (p.firstPct / 100) * p.leverage * 100; // 第一笔名义占分配资金%
 
-  // 硬错误 0：第一笔名义连币安最小下单额都不到，开不出来。
+  // 硬错误 0：第一笔名义连「真正能下出去的最小金额」都不到，开不出来。
   // 用 rounded 到 2 位再比，避免 4.999999 这种浮点误差被当成长度不足。
-  if (Number(firstNotional.toFixed(2)) < minNotional) {
+  if (Number(firstNotional.toFixed(2)) < minNotional - 1e-9) {
+    const byQty = minNotional > rawMinNotional + 1e-9;
     errors.push(
-      `第一笔名义只有 ${firstNotional.toFixed(2)}U，低于币安最小下单额 ${minNotional}U。`
-        + '请把「分配给这个机器人的资金」调大，或把「第一笔保证金占分配资金的比例」调大，或提高杠杆。',
+      `第一笔名义只有 ${firstNotional.toFixed(2)}U，低于该标的的最小可下单金额 ${minNotional.toFixed(2)}U`
+        + (byQty
+          ? `（交易所要求最少 ${Number(opts.minQty).toFixed(4)} 个 / 每次加减 ${Number(opts.stepSize).toFixed(4)} 个，按现价 ${price.toFixed(2)} 算就是 ${minNotional.toFixed(2)}U）`
+          : `（币安最小下单额 ${rawMinNotional.toFixed(2)}U）`)
+        + '。请把「分配给这个机器人的资金」调大，或把「第一笔保证金占分配资金的比例」调大，或提高杠杆。',
     );
   }
   if (firstNotionalPct > 400) {

@@ -4,7 +4,7 @@ data/
 *.db-shm
 *.db-wal
 master.key
-ck.txt
+ck*.txt
 srv.log
 
 # 服务器凭据 / 会话 Cookie / 远程执行脚本：绝不提交
@@ -18,8 +18,7 @@ sv3.txt
 DEPLOY-SERVER.md
 
 # 个人开发过程文档：只留在本地，不进入仓库
-CHANGES.md
-CHANGES-V2.md
+CHANGES*.md
 CONTRACT.md
 
 # 构建产物与压缩包
