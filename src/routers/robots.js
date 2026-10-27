@@ -145,6 +145,11 @@ function shapeRobot(row) {
   let pnlPct = null;
   let totalPnl = null;
   let walletBalance = null;
+  // 资金基数 = 分配资金 + 本机器人累计已实现盈亏（用户 m05585 要求）。
+  // 这是这个机器人下一笔仓位实际会用的基数，前端要能直接看到。
+  let capital = null;
+  let allocatedCapital = Number(params.allocatedCapital) || 0;
+  let realizedPnl = 0;
   if (row.mode === 'paper') {
     const wallet = getWallet(row.user_id);
     walletBalance = Number(wallet.balance || 0);
@@ -152,15 +157,20 @@ function shapeRobot(row) {
       || Number((state && state.lastPrice) || 0);
     const upnl = robotUnrealized(paper, markPrice);
     const real = Number((paper && paper.realizedPnl) || 0);
+    realizedPnl = real;
     equity = Number((walletBalance + upnl).toFixed(8));
     totalPnl = Number((real + upnl).toFixed(8));
-    const base = Number(wallet.initialBalance || 0);
+    // 收益率基数用「本机器人自己分配到的资金」，不是整个账户钱包的初始余额
+    const base = allocatedCapital > 0 ? allocatedCapital : Number(wallet.initialBalance || 0);
     pnlPct = base > 0 ? Number(((totalPnl / base) * 100).toFixed(4)) : 0;
+    capital = Number((base + real).toFixed(8));
   } else if (state && Number.isFinite(Number(state.equity))) {
     equity = Number(state.equity);
+    realizedPnl = Number(state.realizedPnl || 0);
     totalPnl = Number(state.realizedPnl || 0) + Number(state.unrealizedPnl || 0);
-    const base = Number(state.initialEquity || 0);
+    const base = allocatedCapital > 0 ? allocatedCapital : Number(state.initialEquity || 0);
     pnlPct = base > 0 ? Number(((totalPnl / base) * 100).toFixed(4)) : 0;
+    capital = Number((base + realizedPnl).toFixed(8));
   }
 
   const orderCount = get('SELECT COUNT(*) AS c FROM orders WHERE robot_id = ?', row.id);
@@ -182,6 +192,9 @@ function shapeRobot(row) {
     stats: {
       equity,
       walletBalance,
+      capital,
+      allocatedCapital,
+      realizedPnl,
       pnlPct,
       totalPnl,
       orders: Number((orderCount && orderCount.c) || 0),
@@ -206,7 +219,7 @@ export default function registerRobots(app) {
   /** 新建前预览计划（不落库） */
   app.post('/api/robots/preview', async (ctx) => {
     const u = requireAuth(ctx);
-    const { symbol, mode, params: rawParams, equity: rawEquity, anchorPrice } = ctx.body || {};
+    const { symbol, mode, params: rawParams, equity: rawEquity, anchorPrice, realizedPnl: rawRealizedPnl } = ctx.body || {};
     if (!symbol) throw new HttpError(400, 'BAD_SYMBOL', '请选择交易标的');
 
     const paramsMod = await loadParams();
@@ -266,6 +279,9 @@ export default function registerRobots(app) {
       params: normalized,
       rules,
       direction: normalized.direction || 'dual',
+      // 编辑已有机器人时，它自己赚到的钱已并入资金基数（用户 m05585 要求）。
+      // 新建机器人还没交易过，传 0。
+      realizedPnl: Number(rawRealizedPnl) || 0,
     });
     const layers = solver.solveLayers ? solver.solveLayers(plan) : [];
     return {
@@ -311,10 +327,14 @@ export default function registerRobots(app) {
       const price = feed ? safe(() => feed.getPrice(row.symbol), 0) : 0;
       const paper = parseJson(row.paper_json, null);
       let equity;
+      // 机器人自己的累计已实现盈亏：并入资金基数（用户 m05585 要求）
+      let realizedPnl = 0;
       if (row.mode === 'paper') {
         equity = Number(getWallet(row.user_id).balance || 0);
+        realizedPnl = Number((paper && paper.realizedPnl) || 0);
       } else {
         equity = Number((state && state.equity) || 0) || Number(robot.params.allocatedCapital) || 100;
+        realizedPnl = Number((state && state.realizedPnl) || 0);
       }
       plan = solver.solvePlan({
         equity,
@@ -324,6 +344,7 @@ export default function registerRobots(app) {
         // 否则详情页的触发价/均价/止盈止损会跟着实时价一直漂。
         anchorPrice: Number((state && state.anchorPrice) || 0) || 0,
         params: robot.params,
+        realizedPnl,
         // 实盘用交易所真实规则；模拟盘保持原有简单规则
         rules: robot.mode === 'live'
           ? await loadRules(row.symbol)

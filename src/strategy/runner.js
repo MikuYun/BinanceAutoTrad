@@ -272,6 +272,14 @@ async function tick(entry) {
   let anchorPrice = hasAnyLeg ? Number(stForAnchor.anchorPrice || 0) : 0;
   if (!(anchorPrice > 0)) anchorPrice = Number(price) || 0;
 
+  // 资金基数里的「已实现盈亏」（用户 m05585 要求）：
+  //   机器人只被授权动用「分配给它的资金」+「它自己已经赚到的钱」。
+  //   模拟盘直接读账本；实盘读上一次 tick 写进 state 的累计值
+  //   （本次平仓产生的增量下一次 tick 才并入，不影响仓位规模判断）。
+  const ownRealizedPnl = mode === 'paper'
+    ? Number((book && book.realizedPnl) || 0)
+    : Number(stForAnchor.realizedPnl || 0);
+
   const result = decide({
     params,
     book,
@@ -283,6 +291,7 @@ async function tick(entry) {
     rules,
     quote,
     anchorPrice,
+    realizedPnl: ownRealizedPnl,
   });
 
   for (const note of result.notes || []) logEvent(userId, robotId, 'info', note);

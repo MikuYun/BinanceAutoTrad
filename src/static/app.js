@@ -813,7 +813,7 @@ function botCardNode(r) {
   node.innerHTML = `<div class="bot-top"><a class="bot-name" data-f="name" href="#/robots/${encodeURIComponent(r.id)}"></a>
       <div class="bot-badges" data-f="badges"></div></div>
     <div class="bot-meta muted"><span data-f="symbol"></span> · 最后更新 <span data-f="tick"></span></div>
-    <div class="bot-meta muted">分配资金 <b class="mono" data-f="alloc"></b> U<span data-f="extra"></span></div>
+    <div class="bot-meta muted">分配资金 <b class="mono" data-f="alloc"></b> U　当前资金基数 <b class="mono" data-f="capital"></b> U<span data-f="extra"></span></div>
     <div class="bot-nums">
       <div><span class="muted">权益</span><b class="mono" data-f="equity"></b></div>
       <div><span class="muted">收益率</span><b class="mono" data-f="pct"></b></div>
@@ -840,6 +840,8 @@ function patchBotCard(card, r) {
   setText(q('symbol'), r.symbol || '—');
   setText(q('tick'), ago(r.lastTick || r.startedAt));
   setText(q('alloc'), money((r.params || {}).allocatedCapital));
+  // 当前资金基数 = 分配资金 + 本机器人已实现盈亏（赚钱后仓位会变大）
+  setText(q('capital'), money(st.capital));
   const usedMargin = Number(st.marginUsed);
   setText(q('extra'), Number.isFinite(usedMargin) ? ' / 已占用 ' + money(usedMargin) + ' U' : '');
   setText(q('equity'), money(st.equity));
@@ -1139,8 +1141,11 @@ async function viewRobot(id, seq) {
         sub: '多 ' + builtLong + ' 笔 · 空 ' + builtShort + ' 笔' + (r.lastTick ? ' · ' + ago(r.lastTick) + '更新' : '') },
     ]);
     setText(el('rPlanMeta'), r.lastError ? '⚠ ' + String(r.lastError).slice(0, 80) : (plan.feasible === false ? '计划不可行' : '按当前参数生成'));
-    // 分配资金 / 已占用保证金：放在计划卡标题右侧的补一行
-    const capitalLine = '分配资金 ' + money((r.params || {}).allocatedCapital) + ' U / 已占用 ' + money(plan.marginTotal) + ' U';
+    // 分配资金 / 当前资金基数 / 已占用保证金：放在计划卡标题右侧的补一行
+    const capitalLine = '分配资金 ' + money((r.params || {}).allocatedCapital) + ' U'
+      + ' ｜ 当前资金基数 ' + money((r.stats || {}).capital) + ' U（含本机器人已赚 '
+      + signed((r.stats || {}).realizedPnl) + ' U）'
+      + ' ｜ 已占用 ' + money(plan.marginTotal) + ' U';
     patchText(app, '#rCapital', capitalLine);
     if (!dirtyParams) {
       setHTML(el('rPlan'), previewHtml(d));
@@ -1248,11 +1253,14 @@ async function viewRobot(id, seq) {
       try {
         // 编辑已持仓的机器人时沿用当前锚点，否则预览里的触发价会跟着实时价跳（用户问题 #7）
         const stNow = d.state || {};
+        const stStats = (d.robot && d.robot.stats) || {};
         const pv = await apiPost('/api/robots/preview', {
           symbol: d.robot.symbol,
           mode: d.robot.mode,
           params,
           anchorPrice: Number(stNow.anchorPrice) || Number((stNow.plan || {}).anchorPrice) || 0,
+          // 机器人自己已赚到的钱已并入资金基数，预览必须跟实际运行一致
+          realizedPnl: Number(stStats.realizedPnl) || 0,
         });
         el('rEditPreview').innerHTML = previewHtml(pv);
         el('rSave').disabled = false; el('rRevert').disabled = false;

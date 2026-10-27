@@ -101,3 +101,58 @@ test('计划锚点固定时，同一 anchorPrice 产出的阶梯完全一致（�
     '现价变了但锚点没变，阶梯触发价必须一样',
   );
 });
+
+test('资金基数 = 分配资金 + 本机器人已实现盈亏（用户 m05585 要求）', () => {
+  const params = p({ allocatedCapital: 100, firstPct: 1, leverage: 20 });
+
+  // 没赚钱：基数 100 → 第一笔名义 100×1%×20 = 20U
+  const base = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: 0 });
+  assert.equal(base.capital, 100);
+  assert.equal(base.firstLayerNotional, 20);
+  assert.equal(base.allocatedCapital, 100);
+  assert.equal(base.realizedPnl, 0);
+
+  // 赚了 20U：基数 120 → 第一笔名义 120×1%×20 = 24U
+  const gain = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: 20 });
+  assert.equal(gain.capital, 120, '赚到的钱要并入资金基数');
+  assert.equal(gain.firstLayerNotional, 24, '仓位跟着收益一起变大');
+  assert.equal(gain.allocatedCapital, 100, '分配资金本身不变');
+  assert.equal(gain.realizedPnl, 20);
+
+  // 亏了 20U：基数 80 → 第一笔名义 16U
+  const loss = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: -20 });
+  assert.equal(loss.capital, 80, '亏损要从资金基数里扣');
+  assert.equal(loss.firstLayerNotional, 16);
+
+  // 账户权益永远不参与：账户里还有 900U，基数依旧是 100（不是 1000）
+  assert.equal(base.capital, 100, '账户剩余资金不得参与计算');
+});
+
+test('亏光后资金基数归零，不会变负数', () => {
+  const params = p({ allocatedCapital: 100, firstPct: 1, leverage: 20 });
+  const plan = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: -150 });
+  assert.equal(plan.capital, 0, '资金基数不能为负');
+  assert.equal(plan.feasible, false);
+});
+
+test('收益并入基数后，加仓阶梯也按新基数放大', () => {
+  const params = p({
+    allocatedCapital: 100, firstPct: 1, leverage: 20,
+    growRatio: 1.5, spacingPct: 1, maxLayers: 3, totalPct: 50, maxLossPct: 60,
+  });
+  const a = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: 0 });
+  const b = solvePlan({ equity: 1000, price: 100, params, rules: RULES, realizedPnl: 50 });
+  assert.equal(b.capital, 150);
+  // 第二层名义 = 第一层 × 公比，基数变大后同步变大
+  const a2 = a.layerList[1].notional;
+  const b2 = b.layerList[1].notional;
+  assert.ok(b2 > a2, '收益并入后第二层名义必须更大');
+  assert.equal(Number((b2 / a2).toFixed(6)), Number((150 / 100).toFixed(6)));
+});
+
+test('engine.decide 会把 realizedPnl 透传给 solver', () => {
+  const params = p({ allocatedCapital: 100, firstPct: 1, leverage: 20 });
+  const r = decide({ params, book: null, markPrice: 100, equity: 1000, rules: RULES, realizedPnl: 40 });
+  assert.equal(r.plan.capital, 140, 'decide 必须把已实现盈亏并入资金基数');
+  assert.equal(r.plan.firstLayerNotional, 28);
+});

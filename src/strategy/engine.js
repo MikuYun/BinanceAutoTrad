@@ -44,11 +44,13 @@ export function sideState(book, side, markPrice) {
  * @param {object} [p.quote]  实盘持仓快照
  * @param {number} [p.atrPct] 兼容旧调用，仅展示
  * @param {number} [p.anchorPrice] 计划价格锚点（来自上次计划，缺省用当前价）
+ * @param {number} [p.realizedPnl] 本机器人自己的累计已实现盈亏（并入资金基数）
  * @returns {{actions:Array, plan:object, halted:boolean, notes:string[]}}
  */
 export function decide(p) {
   const {
     params, book, markPrice, equity, rules = {}, quote = null, anchorPrice: rawAnchor,
+    realizedPnl: rawRealizedPnl,
   } = p || {};
 
   const actions = [];
@@ -95,6 +97,7 @@ export function decide(p) {
     direction,
     currentLayers: maxLayers,
     anchorPrice,
+    realizedPnl: rawRealizedPnl,
   });
 
   if (!plan.feasible) {

@@ -227,6 +227,9 @@ function buildLadder(n, c) {
  * @param {number} [input.atrPct]    兼容旧调用，仅用于展示，不参与计算
  * @param {number} [input.anchorPrice] 价格锚点（缺省用当前价）。传机器人的计划基准价，
  *                                    这样计划表不会随行情整体漂移。
+ * @param {number} [input.realizedPnl] 这个机器人自己的累计已实现盈亏。
+ *                                    资金基数 = allocatedCapital + realizedPnl（用户要求：
+ *                                    赚到的钱并入本金，下一笔仓位跟着变大）。
  */
 export function solvePlan(input) {
   const {
@@ -237,6 +240,7 @@ export function solvePlan(input) {
     direction = params.direction || 'dual',
     currentLayers = 0,
     anchorPrice: rawAnchor,
+    realizedPnl: rawRealizedPnl,
   } = input || {};
 
   // 账户权益：只用来算强平价（全仓强平取决于整个账户）
@@ -264,10 +268,16 @@ export function solvePlan(input) {
   // 例：SKHYNIXUSDT 价格 975、minQty 0.01、stepSize 0.01 → 最小名义 9.75U > 5U。
   const minNotional = minOrderNotional(price, rules);
 
-  // 资金基数：机器人只被授权动用「分配给自己的资金」。
-  // 只有未配置（<=0 或缺失）时才回退到账户权益，保证老机器人还能跑。
+  // 资金基数：机器人只被授权动用「分配给自己的钱」+「自己已经赚到的钱」。
+  //   用户要求：账号 1000U 分配 100U，那就只能用 100U；这 100U 赚到 20U 以后，
+  //   下一笔的仓位基数变成 120U（第一笔保证金 = firstPct% × 120U），
+  //   加仓倍率/间距/层数这些逻辑保持不变。亏了同理变少。
+  //   账户剩下那 900U 永远不参与这个机器人的仓位计算。
   const allocated = Number(params.allocatedCapital);
-  const capital = allocated > 0 ? allocated : equity;
+  const allocBase = allocated > 0 ? allocated : equity;
+  const robotPnl = Number.isFinite(Number(rawRealizedPnl)) ? Number(rawRealizedPnl) : 0;
+  // 亏光就归零，不让资金基数变负数；也不会拿账户其他钱来补。
+  const capital = Math.max(0, allocBase + robotPnl);
   // 价格锚点：计划里的阶梯触发价都以它为基准
   const anchor = Number(rawAnchor) > 0 ? Number(rawAnchor) : price;
 
@@ -287,6 +297,8 @@ export function solvePlan(input) {
     price,
     equity,
     capital,
+    allocatedCapital: round6(allocBase),
+    realizedPnl: round6(robotPnl),
     anchorPrice: anchor,
     spacingPct: gapPct,
     growRatio,
