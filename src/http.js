@@ -189,6 +189,18 @@ export function requireAuth(ctx) {
 
 const COOKIE_PATH = BASE_PATH || '/';
 
+/** 当前请求是否走的是 HTTPS（直连 TLS，或反向代理透传的 X-Forwarded-Proto: https） */
+export function isSecureRequest(ctx) {
+  const sock = ctx && ctx.req && ctx.req.socket;
+  if (sock && sock.encrypted) return true;
+  const headers = (ctx && ctx.req && ctx.req.headers) || {};
+  const proto = String(headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  return proto === 'https';
+}
+
 /** 设置响应 Cookie */
 export function setCookie(ctx, name, value, opts = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`];
@@ -203,9 +215,9 @@ export function setCookie(ctx, name, value, opts = {}) {
   ctx.res.setHeader('Set-Cookie', list);
 }
 
-/** 清除 Cookie */
-export function clearCookie(ctx, name) {
-  setCookie(ctx, name, '', { maxAge: 0 });
+/** 清除 Cookie（opts 用于携带与设置时一致的 Path/Secure，否则浏览器不认为是同一个 Cookie） */
+export function clearCookie(ctx, name, opts = {}) {
+  setCookie(ctx, name, '', { ...opts, maxAge: 0 });
 }
 
 const MIME = {

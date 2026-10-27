@@ -6,7 +6,7 @@
 import { all, get, run, purgeExpiredSessions } from './db.js';
 import { hashPassword, verifyPassword, randomId } from './crypto.js';
 import { SESSION_TTL_SEC } from './config.js';
-import { HttpError, setCookie, clearCookie } from './http.js';
+import { HttpError, setCookie, clearCookie, isSecureRequest } from './http.js';
 
 export const COOKIE_NAME = 'bt_sid';
 
@@ -154,14 +154,19 @@ export function currentUser(ctx) {
   return ctx.user;
 }
 
-/** 写登录 Cookie */
+/** 写登录 Cookie（HTTPS 下自动带 Secure，HTTP 下不带，否则本地 http 登录会失败） */
 export function attachSession(ctx, token, maxAge) {
-  setCookie(ctx, COOKIE_NAME, token, { maxAge, httpOnly: true, sameSite: 'Lax' });
+  setCookie(ctx, COOKIE_NAME, token, {
+    maxAge,
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: isSecureRequest(ctx),
+  });
 }
 
-/** 清登录 Cookie */
+/** 清登录 Cookie（Path / Secure 必须与写入时一致，否则浏览器删不掉） */
 export function detachSession(ctx) {
-  clearCookie(ctx, COOKIE_NAME);
+  clearCookie(ctx, COOKIE_NAME, { secure: isSecureRequest(ctx) });
 }
 
 /** 启动时清理过期会话 */
