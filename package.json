@@ -3,12 +3,35 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "币安 U 本位永续合约自动化交易机器人平台（零第三方依赖）",
+  "description": "币安 U 本位永续合约自动化交易机器人平台（零第三方依赖，自带网页界面）",
+  "keywords": [
+    "binance",
+    "binance-futures",
+    "binance-usdm",
+    "trading-bot",
+    "quant",
+    "grid-trading",
+    "martingale",
+    "crypto",
+    "nodejs",
+    "zero-dependencies"
+  ],
+  "homepage": "https://github.com/MikuYun/BinanceAutoTrad#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MikuYun/BinanceAutoTrad.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MikuYun/BinanceAutoTrad/issues"
+  },
+  "author": "MikuYun",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=22.5.0"
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node scripts/check.js"
+    "check": "node scripts/check.js",
+    "test": "node --test scripts/"
   }
 }

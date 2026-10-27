@@ -1,6 +1,11 @@
 # 服务器部署手册（Ubuntu 22.04 / 24.04）
 
-把 Node.js 项目部署到一台 Linux 服务器的完整操作手册。
+把本项目部署到一台 Linux 服务器上并长期稳定运行的完整操作手册。
+
+> 只想在**本机**先跑起来看看？看 [docs/QUICKSTART.md](docs/QUICKSTART.md) 就够了，不需要这份文档。
+> 想了解策略与参数？看 [docs/STRATEGY.md](docs/STRATEGY.md)。
+
+本文默认路径为 `/opt/biance_trae`、系统用户为 `biance`、端口 `8787`，都可根据你的环境替换。
 
 ## 0. 项目事实速查
 
@@ -11,21 +16,25 @@
 | 入口 | `node server.js` |
 | 静态前端 | `src/static/`，由 server.js 直接托管 |
 | 数据目录 | `data/`（`app.db`、`master.key`、WAL 文件） |
-| 默认监听 | `127.0.0.1:8787`，**部署必须改成 `0.0.0.0`** |
+| 默认监听 | `127.0.0.1:8787`，**直接对外服务时必须改成 `0.0.0.0`** |
+| 许可证 | Apache-2.0 |
 
 环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8787` | 监听端口 |
-| `HOST` | `127.0.0.1` | **部署必须设 `0.0.0.0`**（若前面有 Nginx 反代则保持 `127.0.0.1`） |
+| `HOST` | `127.0.0.1` | **前面有 Nginx 反代就保持默认**；不走反代直接对外才设 `0.0.0.0` |
 | `BASE_PATH` | 空 | 子路径部署前缀，如 `/biance_trae`（详见 5.6 节），留空=站点根路径 |
 | `LIVE_TRADING` | 未设置（=关） | 实盘下单安全闸，设 `1` 才允许向真实账户发单 |
 | `BT_MASTER_KEY` | 自动生成 | 64 位 hex，用于加密 API Key；不设则自动生成 `data/master.key` |
 | `BINANCE_BASE_URL` | `https://fapi.binance.com` | 币安 U 本位合约 REST |
-| `BINANCE_TIMEOUT_MS` | `8000` | 币安请求超时 |
+| `BINANCE_TIMEOUT_MS` | `8000` | 币安普通请求超时 |
+| `BINANCE_RECV_WINDOW` | `5000` | 签名有效期窗口（1000~60000），代理链路慢时调大 |
+| `BINANCE_TIME_SYNC_MS` | `60000` | 与币安服务器对时的刷新周期 |
 | `TICK_INTERVAL_MS` | `5000` | 机器人 tick 间隔 |
 | `BINANCE_FEED` | `live` | 行情源：`live`=币安实时（默认），`mock`=本地模拟 |
+| `NODE_ENV` | 无 | 设 `production` 只是标记，不改变行为 |
 
 ---
 
@@ -81,9 +90,9 @@ sudo chown -R biance:biance /opt/biance_trae
 ```bash
 sudo -iu biance
 cd /opt/biance_trae
-# 注意：换成你自己的仓库地址；/opt/biance_trae 已存在且非空时，用
-#   git clone <仓库地址> .            直接克隆到当前目录
-git clone <你的仓库地址> .
+# 换成你自己的仓库地址（本项目公开仓库：https://github.com/MikuYun/BinanceAutoTrad）
+# /opt/biance_trae 已存在且非空时，用下面这种「克隆到当前目录」的写法
+git clone https://github.com/MikuYun/BinanceAutoTrad.git .
 ```
 
 ### 2.2 方式 B：scp 上传（无 git 仓库时）
@@ -91,15 +100,13 @@ git clone <你的仓库地址> .
 在**本机（Windows PowerShell）**执行：
 
 ```powershell
-# 注意：把 <服务器IP> 和本地路径换成实际值；.gitutf 之类无需上传
+# 注意：把 <服务器IP> 和本地项目目录换成实际值
 scp -r B:\biance_trae\* biance@<服务器IP>:/opt/biance_trae/
 ```
 
-排除 `data/`（本地调试数据不要带到线上）：
+上传后要排除本地调试数据 `data/`（不要带到线上）：
 
 ```powershell
-# robocopy 先同步到临时目录再 scp，或直接在服务器上删掉上传来的 data/
-scp -r B:\biance_trae\* biance@<服务器IP>:/opt/biance_trae/
 ssh biance@<服务器IP> "rm -rf /opt/biance_trae/data && mkdir -p /opt/biance_trae/data"
 ```
 
@@ -280,13 +287,14 @@ sudo certbot renew --dry-run      # 验证自动续期
 ```
 
 HTTPS 生效后，浏览器访问 `https://your-domain.example.com`。
-登录 Cookie 会带 `Secure` 属性，**只能通过 HTTPS 下发**——这也是必须上证书的原因之一。
+程序会根据请求是否 HTTPS（直连 TLS，或反代透传的 `X-Forwarded-Proto: https`）自动给登录 Cookie 加上 `Secure` 属性，
+**带 Secure 的 Cookie 只能通过 HTTPS 下发**——这也是必须上证书的原因之一。
 
 ---
 
 ### 5.6 部署到已有站点的子路径（`/biance_trae/`）
 
-如果这台服务器的 80/443 已经被别的站点占用（例如已有 `/nover/`、`/miku_ai/`、`/chat/`），
+如果这台服务器的 80/443 已经被别的站点占用（比如已经有一个站点跑在根路径上），
 而你只想把本项目挂到 `http://<域名或IP>/biance_trae/` 下面，**不要去改现有的 server 块**，
 而是把下面的 `location` 块**追加到现有站点配置里**（放最前面，靠 `^~` 阻止其他正则匹配抢走）。
 
@@ -299,7 +307,7 @@ sudo systemctl daemon-reload && sudo systemctl restart biance-trae
 ```
 
 `BASE_PATH` 的作用：后端自动把请求路径上的 `/biance_trae` 前缀剥掉（`/biance_trae/api/me` → `/api/me`），
-并把登录 Cookie 的 `Path` 设成 `/biance_trae`。**不同站点的 Cookie 不会互相覆盖，现有的 /chat/、/miku_ai/ 等登录态不受影响。**
+并把登录 Cookie 的 `Path` 设成 `/biance_trae`。**不同站点的 Cookie 不会互相覆盖，同域其他子路径站点的登录态不受影响。**
 
 **第二步：在 nginx 里追加 location（关键：`proxy_pass` 后面不要带路径）**
 
@@ -325,7 +333,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 > ⚠️ **不会影响现有站点的前提**：新增的只有一个 `^~ /biance_trae/` 前缀 location，
 > 优先级虽然高于普通 location，但它只匹配 `/biance_trae/` 开头的请求，
-> 对 `/nover/`、`/miku_ai/`、`/chat/`、`/codepractice/`、`/api/` 一行都不影响。
+> 对同域其他任何路径（包括别的站点和裸 `/api/`）一行都不影响。
 > 现有配置**一个字都不用改**，回滚也只需删掉这一段再 reload。
 >
 > ⚠️ **如果这台机器上已经存在 `location ^~ /api/`（很多站会把裸 `/api/` 反代到后端）**，
@@ -338,7 +346,7 @@ sudo nginx -t && sudo systemctl reload nginx
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/biance_trae/          # 期望 200
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/biance_trae/app.js    # 期望 200
 curl -s http://127.0.0.1/biance_trae/api/market/health                          # 期望 ok:true
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/nover/                # 期望和部署前一致
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/                       # 期望和部署前一致
 ```
 
 浏览器打开 `http://<域名或IP>/biance_trae/` 即可。注意末尾的 `/` 不能省。
@@ -510,8 +518,8 @@ sudo systemctl restart biance-trae
 ### 8.3 页面能打开但接口返回 401
 
 - 浏览器开发者工具 → Application → Cookies 看会话 Cookie 是否存在
-- HTTPS 下 Cookie 带 `Secure`，**用 http 访问不会带上**，必须走 `https://`
-- 反向代理必须透传 `Host`、`X-Forwarded-Proto`（见 5.4），否则后端判定为 http
+- HTTPS 访问时 Cookie 会带 `Secure` 属性（后端根据 `X-Forwarded-Proto` 自动判定），**用 http 访问不会带上**
+- 反向代理必须透传 `Host`、`X-Forwarded-Proto`（见 5.4），否则后端以为你在走 http，Cookie 不带 `Secure`，同时某些功能也会误判
 - 检查服务器时间是否准确：`timedatectl status`（时间漂移会导致会话/签名校验失败）
 - 清理浏览器该站点 Cookie 后重新登录
 
