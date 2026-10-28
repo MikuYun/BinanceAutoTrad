@@ -17,7 +17,7 @@ import { getMarketFeed, getExchange, loadCredentials } from '../binance/index.js
 import { recordAccountEquity } from './accountStats.js';
 import {
   emptyLiveLegs, parseLiveLegs, addLeg, drainQty, drainLegs, reconcile, bookOf,
-  ownQty, ownAvgEntry, filterBySymbol,
+  ownQty, ownAvgEntry, filterBySymbol, parseBaseline,
 } from './liveBook.js';
 import { tpTargetFor, stopTargetFor, liqPrice } from './solver.js';
 import { desiredCondOrders, diffCondOrders, normalizeCondOrders } from './protect.js';
@@ -167,6 +167,7 @@ async function tick(entry) {
 
   let book = null;
   let legs = null; // 实盘：机器人自己的持仓账本（与用户手动仓隔离）
+  let manualBaseline = null; // 实盘：用户在创建时选择「保留」的手动仓基准
   let wallet = null;
   let cashBefore = 0;
   let pnlBefore = 0;
@@ -219,18 +220,36 @@ async function tick(entry) {
     // 机器人只认自己那部分，绝不碰用户手动开的仓位。
     const prevState = parseJson(row.state_json, null) || {};
     legs = parseLiveLegs(prevState);
-    const rec = reconcile(legs, quote.positions);
+    // 用户创建机器人时如果选择「保留已有持仓」，这里存着那部分手动仓的基准数量。
+    // 对账时必须先扣掉基准，剩下的才算机器人可认领的量——否则用户原有的仓
+    // 会被当成机器人的仓去算层数/均价，甚至在用户手动平仓后触发「重建大仓」。
+    const baseline = parseBaseline(prevState);
+    manualBaseline = baseline;
+    const rec = reconcile(legs, quote.positions, baseline);
     legs = rec.legs;
     // 日志节流：只在「首次发现」或「数量变化」时写事件，否则每 5 秒一条会刷屏
     const prevNotice = prevState.manualNotice || {};
     const notice = {};
     for (const side of ['long', 'short']) {
-      if (rec.clamped[side] > 1e-12) {
+      const sideName = side === 'long' ? '多' : '空';
+      if (rec.missing && rec.missing[side]) {
+        // 账本里还有机器人的仓，但交易所对应方向已经空了：
+        // 只可能是用户手动把这个方向的仓（含机器人那份）全平了。
+        // 必须明确告诉用户「机器人的仓被你平掉了」，而不是静默清账本重开。
         logEvent(
           userId,
           robotId,
           'warn',
-          `对账：${side === 'long' ? '多' : '空'}单在交易所少了 ${Number(rec.clamped[side]).toFixed(6)} 张`
+          `对账：${sideName}单在交易所已归零，但机器人账本里还有 ${Number(rec.clamped[side] || 0).toFixed(6)} 张。`
+            + '说明你手动把这个方向的仓（含机器人的部分）平掉了，机器人已同步清空该方向账本；'
+            + '如果这不是你要的结果，请停止机器人后使用「重置」重建账本。',
+        );
+      } else if (rec.clamped[side] > 1e-12) {
+        logEvent(
+          userId,
+          robotId,
+          'warn',
+          `对账：${sideName}单在交易所少了 ${Number(rec.clamped[side]).toFixed(6)} 张`
             + '（可能是手动平掉了部分仓位），机器人账本已同步缩减',
         );
       }
@@ -242,7 +261,7 @@ async function tick(entry) {
             userId,
             robotId,
             'info',
-            `检测到 ${side === 'long' ? '多' : '空'}单有 ${mq.toFixed(6)} 张非机器人仓位（手动仓），机器人不会动它`,
+            `检测到 ${sideName}单有 ${mq.toFixed(6)} 张非机器人仓位（手动仓），机器人不会动它`,
           );
         }
         notice[side] = key;
@@ -345,6 +364,7 @@ async function tick(entry) {
           short: pos0.filter((x) => x.side === 'short'),
         },
         liveLegs: legs,
+        manualBaseline,
         manualNotice: liveManualNotice || st0.manualNotice || {},
         condOrders: cond0,
         condWarn: condWarn0,
@@ -650,6 +670,7 @@ async function tick(entry) {
         short: ownPositions.filter((x) => x.side === 'short'),
       },
       liveLegs: legs,
+      manualBaseline,
       manualNotice: liveManualNotice || st.manualNotice || {},
       condOrders: condNext || normalizeCondOrders(st.condOrders),
       condWarn: condWarn !== '' ? condWarn : (st.condWarn || ''),

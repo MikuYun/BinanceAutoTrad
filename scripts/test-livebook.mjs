@@ -15,6 +15,9 @@ import {
   ownAvgEntry,
   bookOf,
   filterBySymbol,
+  snapshotBaseline,
+  parseBaseline,
+  hasBaseline,
 } from '../src/strategy/liveBook.js';
 
 test('账本累加与加权均价', () => {
@@ -54,13 +57,74 @@ test('对账：用户手动平掉一部分，账本按比例缩减而不是消�
   assert.ok(Math.abs(ownAvgEntry(legs, 'long') - avgBefore) < 1e-9);
 });
 
-test('对账：用户把仓位全平了，账本清零，机器人不会去平不存在的仓', () => {
+test('对账：用户把仓位全平了，账本清零，并标记 missing 让上层写警告', () => {
   const legs = emptyLiveLegs();
   addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
   const rec = reconcile(legs, [{ side: 'long', qty: 0 }]);
   assert.equal(ownQty(legs, 'long'), 0);
   assert.equal(rec.own.long.qty, 0);
   assert.ok(rec.clamped.long > 0);
+  // missing=true 表示「交易所归零但账本里还有机器人的仓」= 用户手动把含机器人那份全平了
+  assert.equal(rec.missing.long, true);
+});
+
+test('手动仓基准：快照 / 解析 / 判空', () => {
+  const b = snapshotBaseline([
+    { side: 'long', qty: 10, entryPrice: 100 },
+    { side: 'short', qty: 3, entryPrice: 101 },
+  ]);
+  assert.equal(b.long, 10);
+  assert.equal(b.short, 3);
+  assert.ok(b.at > 0);
+  assert.equal(hasBaseline(b), true);
+  assert.equal(hasBaseline({ long: 0, short: 0 }), false);
+  assert.equal(hasBaseline(null), false);
+
+  const parsed = parseBaseline({ manualBaseline: b });
+  assert.equal(parsed.long, 10);
+  assert.equal(parsed.short, 3);
+  // 容错：没有 state / 没有字段 / 脏数据都要返回 0
+  const none = parseBaseline(null);
+  assert.equal(none.long, 0);
+  assert.equal(none.short, 0);
+  const dirty = parseBaseline({ manualBaseline: { long: 'x', short: NaN } });
+  assert.equal(dirty.long, 0);
+  assert.equal(dirty.short, 0);
+});
+
+test('对账：有手动仓基准时，先扣掉基准再算机器人可认领的量', () => {
+  const legs = emptyLiveLegs();
+  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
+  // 用户原本就有 10 张，机器人自己又开了 1 张 → 交易所 11 张
+  const baseline = { long: 10, short: 0, at: Date.now() };
+  const rec = reconcile(legs, [{ side: 'long', qty: 11 }], baseline);
+  // 扣掉基准 10 后剩 1 = 机器人自己的，没有被误认为手动仓，也没被缩减
+  assert.equal(rec.own.long.qty, 1);
+  assert.equal(rec.manual.long, 0);
+  assert.equal(rec.clamped.long, undefined);
+  assert.equal(rec.missing.long, undefined);
+});
+
+test('对账：有基准时用户把「包含机器人那份」全平掉 → 账本清零并标 missing', () => {
+  const legs = emptyLiveLegs();
+  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
+  const baseline = { long: 10, short: 0, at: Date.now() };
+  // 用户把 11 张全平了 → 交易所归零，扣掉基准后也是 0
+  const rec = reconcile(legs, [{ side: 'long', qty: 0 }], baseline);
+  assert.equal(ownQty(legs, 'long'), 0);
+  assert.equal(rec.missing.long, true);
+});
+
+test('对账：有基准时用户只平掉自己的手动仓 → 机器人账本必须原封不动', () => {
+  const legs = emptyLiveLegs();
+  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
+  const baseline = { long: 10, short: 0, at: Date.now() };
+  // 用户平掉自己的 10 张，交易所只剩机器人的 1 张
+  const rec = reconcile(legs, [{ side: 'long', qty: 1 }], baseline);
+  assert.equal(rec.clamped.long, undefined);
+  assert.equal(rec.missing.long, undefined);
+  assert.equal(ownQty(legs, 'long'), 1);
+  assert.equal(rec.manual.long, 0);
 });
 
 test('平仓按数量扣减，均价不变，数量扣不完就扣到 0', () => {

@@ -216,6 +216,55 @@ export default function registerRobots(app) {
     return rows.map(shapeRobot);
   });
 
+  /**
+   * 查某个交易对在币安账户里的现有持仓（建机器人前用）。
+   *
+   * 为什么需要这个接口：币安双向持仓模式下 positionRisk 返回的是账户级聚合仓，
+   * 程序分不清「机器人开的」和「用户手动开的」。如果用户已经有仓，机器人启动后
+   * 会把用户那部分当成「非机器人仓位」忽略，用户就会看到「机器人是小仓、账户是大仓」。
+   * 所以建机器人前先告诉用户「这个币你已经有仓了」，让用户选保留还是从零开始。
+   */
+  app.get('/api/robots/live-position', async (ctx) => {
+    const u = requireAuth(ctx);
+    const symbol = String((ctx.query && ctx.query.symbol) || '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{2,20}$/.test(symbol)) {
+      throw new HttpError(400, 'BAD_SYMBOL', '交易标的格式不正确');
+    }
+    const out = { symbol, configured: false, error: null, hasPosition: false, long: null, short: null };
+    let creds = null;
+    try {
+      const mod = await import('../binance/index.js');
+      creds = mod.loadCredentials(u.id);
+    } catch {
+      creds = null;
+    }
+    if (!creds) {
+      out.needKey = true;
+      out.error = '未配置可用的 API Key，无法读取币安持仓。';
+      return out;
+    }
+    out.configured = true;
+    try {
+      const live = await import('../binance/live.js');
+      const quote = await live.fetchAccount(creds);
+      const list = (quote && quote.positions) || [];
+      for (const side of ['long', 'short']) {
+        const pos = list.find((p) => p && p.symbol === symbol && p.side === side);
+        if (!pos || !(Number(pos.qty) > 0)) continue;
+        out[side] = {
+          qty: Number(pos.qty),
+          entryPrice: Number(pos.entryPrice) || 0,
+          unrealizedPnl: Number(pos.unrealizedPnl) || 0,
+          leverage: Number(pos.leverage) || 0,
+        };
+        out.hasPosition = true;
+      }
+    } catch (e) {
+      out.error = `读取币安持仓失败：${(e && e.message) || e}`;
+    }
+    return out;
+  });
+
   /** 新建前预览计划（不落库） */
   app.post('/api/robots/preview', async (ctx) => {
     const u = requireAuth(ctx);
@@ -426,21 +475,57 @@ export default function registerRobots(app) {
     const id = randomId('r');
     const ts = nowTs();
     const paper = mode === 'paper' ? initPaperState() : null;
+
+    // 实盘：处理「该币已有手动仓」的选择。
+    //   discard（默认）= 从零开始，不记录任何基准；
+    //   keep          = 把创建这一刻的持仓登记成「手动仓基准」，
+    //                   机器人对账时先扣掉基准，绝不把用户原有的仓当成自己的仓。
+    const manualPolicy = mode === 'live' && body.manualPolicy === 'keep' ? 'keep' : 'discard';
+    let stateInit = null;
+    let baseline = { long: 0, short: 0, at: 0 };
+    if (mode === 'live') {
+      if (manualPolicy === 'keep') {
+        try {
+          const liveBook = await import('../strategy/liveBook.js');
+          const idx = await import('../binance/index.js');
+          const creds = idx.loadCredentials(u.id);
+          if (!creds) {
+            throw new HttpError(400, 'NO_API_KEY', '读取现有持仓需要先配置并验证 API Key。');
+          }
+          const live = await import('../binance/live.js');
+          const quote = await live.fetchAccount(creds);
+          const only = liveBook.filterBySymbol(quote.positions, symbol);
+          baseline = liveBook.snapshotBaseline(only);
+        } catch (e) {
+          if (e instanceof HttpError) throw e;
+          throw new HttpError(400, 'LIVE_POSITION_FAILED', `读取现有持仓失败，无法保留手动仓：${(e && e.message) || e}`);
+        }
+      }
+      stateInit = JSON.stringify({ manualPolicy, manualBaseline: baseline });
+    }
+
     run(
       `INSERT INTO robots
        (id, user_id, name, symbol, mode, status, params_json, state_json, paper_json,
         created_at, updated_at, started_at, last_tick, last_error)
-       VALUES (?, ?, ?, ?, ?, 'stopped', ?, NULL, ?, ?, ?, NULL, NULL, NULL)`,
+       VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
       id,
       u.id,
       name,
       symbol,
       mode,
       JSON.stringify(params),
+      stateInit,
       paper ? JSON.stringify(paper) : null,
       ts,
       ts,
     );
+    if (mode === 'live' && manualPolicy === 'keep') {
+      run('INSERT INTO events (user_id, robot_id, level, message, ts) VALUES (?, ?, ?, ?, ?)',
+        u.id, id, 'info',
+        `已把创建时该交易对已有的持仓登记为「手动仓基准」（多 ${Number(baseline.long || 0)} 张 / 空 ${Number(baseline.short || 0)} 张），机器人不会用它计算交易。`,
+        ts);
+    }
     return { robot: shapeRobot(get('SELECT * FROM robots WHERE id = ?', id)) };
   });
 
@@ -522,6 +607,33 @@ export default function registerRobots(app) {
           'NO_API_KEY',
           '实盘模式需要先在「API Key」页面配置并验证密钥。未验证前请使用模拟模式。',
         );
+      }
+
+      // 用户选「保留手动仓」时，基准要不要在启动时重拍一次？
+      // 必须重拍：创建机器人到真正启动可能隔了几分钟甚至几天，仓位早变了。
+      // 但只在机器人还没有自己账本时重拍（已有账本重拍会把机器人的仓当成手动仓）。
+      const st0 = parseJson(row.state_json, null) || {};
+      const legs0 = st0.liveLegs || {};
+      const hasOwnLegs = (legs0.long || []).length > 0 || (legs0.short || []).length > 0;
+      if (st0.manualPolicy === 'keep' && !hasOwnLegs) {
+        try {
+          const liveBook = await import('../strategy/liveBook.js');
+          const idx = await import('../binance/index.js');
+          const creds = idx.loadCredentials(u.id);
+          if (!creds) throw new Error('没有可用的 API Key');
+          const live = await import('../binance/live.js');
+          const quote = await live.fetchAccount(creds);
+          const only = liveBook.filterBySymbol(quote.positions, row.symbol);
+          const baseline = liveBook.snapshotBaseline(only);
+          run('UPDATE robots SET state_json = ?, updated_at = ? WHERE id = ?',
+            JSON.stringify({ ...st0, manualBaseline: baseline }), nowTs(), row.id);
+          run('INSERT INTO events (user_id, robot_id, level, message, ts) VALUES (?, ?, ?, ?, ?)',
+            u.id, row.id, 'info',
+            `启动时重新登记手动仓基准：多 ${Number(baseline.long || 0)} 张 / 空 ${Number(baseline.short || 0)} 张（这部分不参与机器人计算）。`,
+            nowTs());
+        } catch (e) {
+          throw new HttpError(400, 'LIVE_POSITION_FAILED', `启动前读取现有持仓失败，无法保留手动仓：${(e && e.message) || e}`);
+        }
       }
     }
 
