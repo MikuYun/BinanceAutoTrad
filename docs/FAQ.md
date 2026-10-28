@@ -1,3 +1,5 @@
+**中文** ｜ [English](en/FAQ.md) ｜ [日本語](ja/FAQ.md)
+
 # 常见问题（FAQ）
 
 > 跑起来之后最容易撞上的问题都在这。第一次上手先看 [QUICKSTART.md](QUICKSTART.md)，策略原理看 [STRATEGY.md](STRATEGY.md)，部署/HTTPS/备份看 [DEPLOY.md](../DEPLOY.md)。

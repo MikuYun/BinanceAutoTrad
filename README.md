@@ -1,3 +1,5 @@
+**中文** ｜ [English](README.en.md) ｜ [日本語](README.ja.md)
+
 # 币安自动交易机器人 · BinanceAutoTrad
 
 > 一个带网页界面的币安合约机器人：**跌了分几笔加仓摊低成本，反弹回本有赚就止盈**。

@@ -1,3 +1,5 @@
+**中文** ｜ [English](CONTRIBUTING.en.md) ｜ [日本語](CONTRIBUTING.ja.md)
+
 # 贡献指南
 
 感谢你愿意改进这个项目。本文说明怎么把环境跑起来、代码怎么写、提交前要过哪些检查。

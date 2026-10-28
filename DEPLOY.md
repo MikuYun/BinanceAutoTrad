@@ -1,3 +1,5 @@
+**中文** ｜ [English](DEPLOY.en.md) ｜ [日本語](DEPLOY.ja.md)
+
 # 服务器部署手册（Ubuntu 22.04 / 24.04）
 
 把本项目部署到一台 Linux 服务器上并长期稳定运行的完整操作手册。

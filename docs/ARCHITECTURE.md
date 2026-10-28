@@ -1,3 +1,5 @@
+**中文** ｜ [English](en/ARCHITECTURE.md) ｜ [日本語](ja/ARCHITECTURE.md)
+
 # 代码架构与阅读指引
 
 > 面向想读懂这份代码、或者想动手改它的人。本文结论全部来自仓库里的实际代码。

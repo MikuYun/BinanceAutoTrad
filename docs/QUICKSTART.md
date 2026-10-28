@@ -1,3 +1,5 @@
+**中文** ｜ [English](en/QUICKSTART.md) ｜ [日本語](ja/QUICKSTART.md)
+
 # 快速上手
 
 从零到跑通第一个模拟盘机器人，大约 **5 分钟**。跟着做就行，不需要懂代码。
