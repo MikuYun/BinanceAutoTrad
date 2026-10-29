@@ -50,8 +50,10 @@ export function sideState(book, side, markPrice) {
 export function decide(p) {
   const {
     params, book, markPrice, equity, rules = {}, quote = null, anchorPrice: rawAnchor,
-    realizedPnl: rawRealizedPnl,
+    realizedPnl: rawRealizedPnl, takeover: rawTakeover = null,
   } = p || {};
+  // 接管模式：这些方向上的仓位是从交易所接管来的，只等止盈全平，不加仓
+  const takeover = rawTakeover || {};
 
   const actions = [];
   const notes = [];
@@ -177,7 +179,10 @@ export function decide(p) {
     }
 
     /* ---------- 2) 止盈（永远按实际均价现算，这是核心修复） ---------- */
-    if (tpMode === 'avg') {
+    // 接管模式（用户 m06852）：这一边含接管来的仓位，用户要求「等机器人设定的止盈价格时
+    // 全部平掉」，所以强制走整体止盈（按交易所实际均价算），不能走逐笔止盈只平一部分。
+    const sideTakeover = Boolean(takeover && takeover[side] && Number(takeover[side].qty) > 0);
+    if (tpMode === 'avg' || sideTakeover) {
       // 整体止盈：整边一起走，触发价 = 实际均价 ± tpPct
       const tpPrice = tpTargetFor(side, st.avgEntry, params);
       const hitTp = side === 'long' ? markPrice >= tpPrice : markPrice <= tpPrice;
@@ -186,7 +191,9 @@ export function decide(p) {
           type: 'close',
           side,
           price: markPrice,
-          reason: `整体止盈（实际均价 ${st.avgEntry.toFixed(4)} + ${params.tpPct}% → ${tpPrice.toFixed(4)}）`,
+          reason: sideTakeover
+            ? `接管止盈（实际均价 ${st.avgEntry.toFixed(4)} + ${params.tpPct}% → ${tpPrice.toFixed(4)}，整边全平）`
+            : `整体止盈（实际均价 ${st.avgEntry.toFixed(4)} + ${params.tpPct}% → ${tpPrice.toFixed(4)}）`,
         });
         continue;
       }
@@ -214,6 +221,16 @@ export function decide(p) {
     }
 
     /* ---------- 3) 加仓：价格相对实际均价走过一层间距 ---------- */
+    // 接管模式（用户 m06852）：这一边全部是从交易所接管来的仓位，
+    // 只等「按交易所真实均价算出的止盈价」把整边一次全平，不加仓。
+    if (takeover && takeover[side] && Number(takeover[side].qty) > 0) {
+      const tpT = tpTargetFor(side, st.avgEntry, params);
+      notes.push(
+        `${side} 正接管交易所已有仓位 ${Number(takeover[side].qty).toFixed(6)} 张`
+          + `（实际均价 ${st.avgEntry.toFixed(6)}），只等止盈价 ${tpT.toFixed(6)} 一次性全平`,
+      );
+      continue;
+    }
     const nextLayer = st.layers + 1;
     if (nextLayer > plan.layers) {
       notes.push(`${side} 已加到计划上限 ${plan.layers} 层，只等止盈或止损`);

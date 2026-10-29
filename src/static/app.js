@@ -939,12 +939,13 @@ async function openCreateBot(seq) {
   const cLiveWarn = bodyEl.querySelector('#cLiveWarn');
   let lastPreview = null;
   // 实盘：建机器人前先查该交易对是否已经有仓。
-  // 币安双向持仓是账户级聚合，程序分不清「机器人开的」和「用户手动开的」，
-  // 所以必须让用户明确选：从零开始（推荐）还是保留现有仓作为手动仓（不参与交易计算）。
-  let manualPolicy = 'discard';
+  // 币安双向持仓是账户级聚合，程序分不清「机器人开的」和「用户手动开的」。
+  // 现行规则（用户 m06852）：机器人一旦启动就**接管该交易对全部仓位** ——
+  // 已有仓会被登记进机器人账本、按交易所真实均价等止盈价一次性全平，然后才重建第一层。
+  // 所以这里只做「提前告知」，不再让用户二选一。
   let liveCheckSeq = 0;
   const checkLivePosition = async () => {
-    if (cMode.value !== 'live') { cLiveWarn.innerHTML = ''; manualPolicy = 'discard'; return; }
+    if (cMode.value !== 'live') { cLiveWarn.innerHTML = ''; return; }
     const my = ++liveCheckSeq;
     cLiveWarn.innerHTML = '<span class="muted">正在检查该交易对的现有持仓…</span>';
     let d = null;
@@ -964,28 +965,15 @@ async function openCreateBot(seq) {
       cLiveWarn.innerHTML = `<div class="banner banner-warn">${esc(d.error)}</div>`;
       return;
     }
-    if (!d.hasPosition) { cLiveWarn.innerHTML = ''; manualPolicy = 'discard'; return; }
+    if (!d.hasPosition) { cLiveWarn.innerHTML = ''; return; }
     const parts = [];
     if (d.long) parts.push(`多单 ${num(d.long.qty, 6)} 张（开仓价 ${money(d.long.entryPrice, 4)}）`);
     if (d.short) parts.push(`空单 ${num(d.short.qty, 6)} 张（开仓价 ${money(d.short.entryPrice, 4)}）`);
     cLiveWarn.innerHTML = `<div class="banner banner-warn" style="display:block">
       <div><b>这个交易对已经有持仓</b>：${esc(parts.join('；'))}。</div>
-      <div style="margin-top:8px">币安双向持仓是账户级聚合的，程序分不清哪部分是你手动开的。请选择怎么处理：</div>
-      <label style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;cursor:pointer">
-        <input type="radio" name="cManualPolicy" value="discard" checked>
-        <span><b>不保留，从零开始（推荐）</b><br><span class="muted">现有持仓不动，机器人只按自己的参数开新仓。这两部分仓位在账户里会叠加，风险要你自己控。</span></span>
-      </label>
-      <label style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;cursor:pointer">
-        <input type="radio" name="cManualPolicy" value="keep">
-        <span><b>保留为「手动仓」，机器人不碰它</b><br><span class="muted">把现在的持仓数量登记成基准，之后对账时先扣掉它，不会当成机器人的仓去算层数/均价，也不会去平它。注意：如果你之后手动加仓或减仓，最好停一下机器人重新设置。</span></span>
-      </label>
+      <div style="margin-top:8px">机器人启动后会<b>接管这里全部仓位</b>：把这部分仓登记进机器人账本，按交易所真实均价算出实际止盈价，价位到了就一次性全部平掉，然后才重新建第一层。接管期间不加仓（因为没等到止盈价再往下加仓只会让风险越来越大）。</div>
+      <div style="margin-top:8px" class="muted">如果你希望机器人从现在起完全按自己的参数开始、不被现有仓影响，请先手动把该交易对的仓位平掉再启动机器人。</div>
     </div>`;
-    manualPolicy = 'discard';
-    cLiveWarn.querySelectorAll('input[name="cManualPolicy"]').forEach((el) => {
-      el.addEventListener('change', () => {
-        if (el.checked) manualPolicy = el.value === 'keep' ? 'keep' : 'discard';
-      });
-    });
   };
   const preview = debounce(async () => {
     const params = collectForm(cParams, schema);
@@ -1015,7 +1003,6 @@ async function openCreateBot(seq) {
       symbol: cSym.value,
       mode: cMode.value,
       params: collectForm(cParams, schema),
-      manualPolicy: cMode.value === 'live' ? manualPolicy : 'discard',
     };
     btn.disabled = true; btn.textContent = '创建中…';
     try {
@@ -1199,10 +1186,13 @@ async function viewRobot(id, seq) {
       + ' ｜ 当前资金基数 ' + money((r.stats || {}).capital) + ' U（含本机器人已赚 '
       + signed((r.stats || {}).realizedPnl) + ' U）'
       + ' ｜ 已占用 ' + money(plan.marginTotal) + ' U';
-    // 实盘：如果用户创建时选择了「保留手动仓」，把基准数量显示出来，避免用户忘了
-    const mb = st.manualBaseline;
-    if (r.mode === 'live' && mb && (Number(mb.long) > 0 || Number(mb.short) > 0)) {
-      capitalLine += ' ｜ 手动仓基准 多 ' + num(mb.long, 6) + ' / 空 ' + num(mb.short, 6) + ' 张（不参与计算）';
+    // 实盘：如果机器人正在接管交易所已有仓位，把接管数量与止盈价显示出来，避免用户忘了
+    const tk = st.takeover || {};
+    for (const sd of ['long', 'short']) {
+      const t = tk[sd];
+      if (!t || !(Number(t.qty) > 0)) continue;
+      capitalLine += ' ｜ 正接管' + (sd === 'long' ? '多' : '空') + '单 ' + num(t.qty, 6) + ' 张'
+        + '（实际均价 ' + money(t.entryPrice, 6) + '，到止盈价一次性全平）';
     }
     patchText(app, '#rCapital', capitalLine);
     if (!dirtyParams) {

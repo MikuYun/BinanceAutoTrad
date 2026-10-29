@@ -275,26 +275,35 @@ function stableHash(str) {
 }
 
 /**
- * 生成**确定性** clientOrderId：同一个「机器人 + 侧 + 第几笔 + 动作 + 时间桶」永远得到同一个 id。
+ * 生成**确定性** clientOrderId：同一个「机器人 + 侧 + 第几笔 + 动作 + 意图序号」永远得到同一个 id。
  *
  * 为什么不用 Date.now()：网络超时后平台以为没下单、下一轮 tick 又发一次，
  * 带时间戳的 id 每次都不一样，币安就当成两笔独立订单 → 真实重复开仓。
  * 用确定性 id 后，第二次发送会被币安按 -4015/-4116 (duplicate clientOrderId) 拒掉，
  * 我们再按 id 回查，就知道「其实第一笔已经成交了」。
  *
+ * 历史教训（docs/BUGFIX-PLAN-client-order-id-unique.md）：
+ *   上一版把「5 分钟时间桶」当成意图序号，同一桶内二次开仓得到**完全相同**的 id：
+ *   第一次成交后 recordOrder 抛 UNIQUE 异常、账本没记上，下一 tick 又发同一笔 →
+ *   币安把已成交的市价单再当新单成交，交易所真实持仓越加越大、账本一直是 0。
+ *   所以序号必须由调用方按「每次真实意图」递增，不能随时间循环。
+ *
  * @param {string} robotId
  * @param {'long'|'short'|string} side  仓位方向
  * @param {number} layer               第几笔
  * @param {'op'|'cl'|'tp'|'sl'|string} action
- * @param {number} [bucketMs]          时间桶（默认 5 分钟）：同一桶内视为同一次意图
+ * @param {number|string} [seq]        意图序号（同一意图重试传同一个值，不同意图必须不同）
  */
-export function makeClientId(robotId, side, layer, action, bucketMs = 300000) {
+export function makeClientId(robotId, side, layer, action, seq) {
   const rb = String(robotId).replace(/[^A-Za-z0-9]/g, '').slice(-6) || 'r';
   const sd = String(side || 'x').slice(0, 1).toLowerCase();
   const act = String(action || 'ord').replace(/[^A-Za-z0-9]/g, '').slice(0, 2) || 'or';
   const lay = Math.max(0, Math.min(999, Number(layer) || 0));
-  const bucket = Math.floor(Date.now() / Math.max(1000, bucketMs)).toString(36);
-  return `bt${rb}${sd}${lay}${act}${bucket}`.slice(0, 36);
+  const n = Number(seq);
+  const sq = Number.isFinite(n) && n >= 0
+    ? n.toString(36)
+    : stableHash(String(seq == null ? '' : seq)).slice(-5);
+  return `bt${rb}${sd}${lay}${act}${sq}`.slice(0, 36);
 }
 
 /**
@@ -390,6 +399,23 @@ async function recoverByClientId(credentials, symbol, clientOrderId, times = 3) 
 }
 
 /**
+ * 按 clientAlgoId 回查 Algo 条件单（下单超时/重复 id 时用）。
+ * 注意：Algo 单的订单号字段是 algoId（不是 orderId）、状态字段是 algoStatus。
+ */
+async function recoverAlgoByClientId(credentials, symbol, clientAlgoId, times = 3) {
+  for (let i = 0; i < times; i += 1) {
+    await sleep(500 * (i + 1));
+    try {
+      const o = await rest.queryAlgoOrder(credentials, { clientAlgoId });
+      if (o && (o.algoId || o.algoStatus)) return o;
+    } catch (err) {
+      if (isNotExistError(err)) continue;
+    }
+  }
+  return null;
+}
+
+/**
  * 实盘下单（带幂等恢复）。
  *
  * @param {object} credentials
@@ -476,9 +502,16 @@ export async function placeOrder(credentials, spec) {
 /**
  * 挂止盈 / 止损条件单（双向持仓模式）。
  *
+ * 走的是 Algo Order 端点（`POST /fapi/v1/algoOrder`，algoType=CONDITIONAL）。
+ *
+ * 为什么不能用 `/fapi/v1/order`：币安已经对 STOP_MARKET / TAKE_PROFIT_MARKET 关闭了那个端点，
+ * 返回 `Order type not supported for this endpoint. Please use the Algo Order API endpoints instead.`
+ * 结果就是实盘机器人交易所侧一张止损单都没有（只能靠 5 秒 tick 的软件止损，
+ * 行情跳空/断网时等于裸仓）。字段名也不一样：triggerPrice（不是 stopPrice）、
+ * clientAlgoId（不是 newClientOrderId）。
+ *
  * 用 TAKE_PROFIT_MARKET / STOP_MARKET + positionSide + quantity：
- * quantity 只填机器人自己那部分，不会碰用户手动仓。
- * 不用 closePosition：那会平掉整个方向的仓位（含用户手动仓）。
+ * 从不使用 closePosition（那会平掉整个方向的仓位）。
  *
  * @param {object} credentials
  * @param {object} spec
@@ -502,29 +535,30 @@ export async function placeConditional(credentials, spec) {
   for (const attempt of attempts) {
     // 平多 = SELL + positionSide LONG；平空 = BUY + positionSide SHORT
     const form = {
+      algoType: 'CONDITIONAL',
       symbol,
       side: isLong ? 'SELL' : 'BUY',
       positionSide: isLong ? 'LONG' : 'SHORT',
       type: orderType,
-      stopPrice: attempt.stopPrice,
+      triggerPrice: attempt.stopPrice,
       workingType: 'MARK_PRICE',
       quantity: attempt.quantity,
     };
-    if (spec.clientOrderId) form.newClientOrderId = spec.clientOrderId;
+    if (spec.clientOrderId) form.clientAlgoId = spec.clientOrderId;
     try {
-      return await rest.newOrder(credentials, form);
+      return await rest.newAlgoOrder(credentials, form);
     } catch (err) {
       if (isPrecisionError(err)) {
         lastPrecisionErr = err;
         continue;
       }
       if (isDuplicateError(err) && spec.clientOrderId) {
-        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        const found = await recoverAlgoByClientId(credentials, symbol, spec.clientOrderId);
         if (found) return { ...found, _recovered: 'duplicate' };
       }
       if ((err && err.network) || (err && err.binanceCode === -1007)) {
         if (!spec.clientOrderId) throw err;
-        const found = await recoverByClientId(credentials, symbol, spec.clientOrderId);
+        const found = await recoverAlgoByClientId(credentials, symbol, spec.clientOrderId);
         if (found) return { ...found, _recovered: 'timeout' };
         return null;
       }
@@ -545,12 +579,20 @@ export async function cancel(credentials, symbol, idOrClientId) {
   }
 }
 
-/** 按 clientOrderId 撤单 */
+/** 按 clientOrderId 撤单（普通单先试，再试 Algo 条件单） */
 export async function cancelByClientId(credentials, symbol, clientOrderId) {
   try {
     return await rest.cancelOrder(credentials, symbol, clientOrderId, true);
   } catch (err) {
-    if (isNotExistError(err)) return { noop: true };
+    if (isNotExistError(err)) {
+      // 普通单端点说没这张单 → 可能是 Algo 条件单（保护单现在挂在 Algo 端点上）
+      try {
+        return await rest.cancelAlgoOrder(credentials, { clientAlgoId: clientOrderId });
+      } catch (err2) {
+        if (isNotExistError(err2)) return { noop: true };
+        throw err2;
+      }
+    }
     throw err;
   }
 }
@@ -566,9 +608,43 @@ export async function setLeverage(credentials, symbol, leverage) {
   }
 }
 
-/** 取挂单 */
+/** 取挂单（普通单） */
 export async function fetchOpenOrders(credentials, symbol) {
   return rest.openOrders(credentials, symbol);
+}
+
+/**
+ * 取「所有」挂单，普通单 + Algo 条件单合并。
+ *
+ * 为什么要合并：止盈/止损现在走 Algo 端点，不在 /fapi/v1/openOrders 里。
+ * syncProtection 靠这个列表判断「我挂的还在不在」，不合并就会把每张保护单
+ * 都当成「已消失」→ 每轮都撤销重挂（白烧流量，还会反复短时无保护）。
+ */
+export async function fetchAllOpenOrders(credentials, symbol) {
+  const out = [];
+  try {
+    const normal = await rest.openOrders(credentials, symbol);
+    if (Array.isArray(normal)) out.push(...normal);
+  } catch {
+    /* 下面 algo 也一样，一个失败不影响另一个 */
+  }
+  try {
+    const algo = await rest.openAlgoOrders(credentials, symbol);
+    const list = Array.isArray(algo) ? algo : (Array.isArray(algo && algo.orders) ? algo.orders : []);
+    for (const o of list) {
+      out.push({
+        ...o,
+        // 统一成普通单的字段名，让 diffCondOrders 能用同一套逻辑
+        clientOrderId: o.clientAlgoId || o.clientOrderId || '',
+        orderId: o.algoId || o.orderId || 0,
+        status: o.algoStatus || o.status || '',
+        _algo: true,
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
 }
 
 /** 按 clientOrderId 查询订单（供 runner 做幂等校验） */
@@ -595,6 +671,7 @@ export const liveExchange = {
   cancelByClientId,
   setLeverage,
   fetchOpenOrders,
+  fetchAllOpenOrders,
   queryOrder,
   floorStep,
   roundTick,

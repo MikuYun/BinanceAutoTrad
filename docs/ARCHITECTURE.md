@@ -123,11 +123,11 @@
 |---|---|---|
 | `params.js` | 371 | 参数 schema、默认值、旧参数名归一化、参数校验（含最小下单额判断） |
 | `solver.js` | 524 | 纯数学求解：最小可下单额、强平价、止盈止损目标、加仓阶梯、可行性判定 |
-| `engine.js` | 259 | 决策状态机：把「持仓 + 行情 + 计划」翻译成一组 `action` |
-| `runner.js` | 1087 | 编排器：每个机器人一个定时器，串起行情→账本→决策→执行→落库 |
+| `engine.js` | 276 | 决策状态机：把「持仓 + 行情 + 计划」翻译成一组 `action` |
+| `runner.js` | 1210 | 编排器：每个机器人一个定时器，串起行情→账本→决策→执行→落库 |
 | `wallet.js` | 243 | 模拟盘账户级共享钱包：现金记 `paper_accounts`，持仓记 `robots.paper_json` |
-| `liveBook.js` | 174 | 实盘机器人自己的持仓账本 `liveLegs`，与交易所对账以隔离用户手动仓 |
-| `protect.js` | 192 | 保护单意图：算出「应该挂哪些止盈止损」，与已挂单做差量 |
+| `liveBook.js` | 280 | 实盘持仓账本 `liveLegs` + 接管状态：交易所是唯一真相源，多出来的仓位全部接管 |
+| `protect.js` | 198 | 保护单意图：算出「应该挂哪些止盈止损」，与已挂单做差量 |
 | `accountStats.js` | 250 | 账户级权益快照、日基准、账户曲线与今日盈亏 |
 
 ### 前端与脚本
@@ -178,7 +178,7 @@
 | 4 | 确认仍在运行 | 重查 `SELECT * FROM robots WHERE id=?`，`status !== 'running'` 就 `stopRobot` 收摊 |
 | 5 | 取规则 | `getExchange(mode)`；live 用 `getLiveRules(symbol)`（10 分钟缓存），paper 用 `PAPER_RULES` |
 | 6 | 算钱 | paper：`getWallet` + `mergeBook(paper_json, wallet)` 拼 book，`equityOf(book, price)`；live：`loadCredentials` → `fetchAccount` 读真实权益，且**必须** `filterBySymbol(quote.positions, symbol)` |
-| 7 | 实盘对账 | `parseLiveLegs` + `reconcile(legs, quote.positions)`：多出来的是手动仓（`info`，节流），少了就按比例缩减账本（`warn`） |
+| 7 | 实盘对账 | `parseLiveLegs` + `parseTakeover` + `reconcile(legs, quote.positions, takeover, rules)`：交易所多出来的仓位**全部接管**进账本（`info`，节流），少了就按比例缩减账本（`warn`）；容差 = `max(1e-8, stepSize/2)` |
 | 8 | 权益闸 | `equity <= 0` → 写「权益为 0，无法计算仓位」并返回 |
 | 9 | 定锚点 | 有持仓 → 沿用 `state.anchorPrice`；空仓 → 用当前价（持仓期间触发价不漂移） |
 | 10 | 求解计划 | `decide({...})` 内部调 `solvePlan`，再按持仓状态产出 `actions` / `notes` |
@@ -284,7 +284,7 @@ robots.paper_json（每机器人一份，机器人级）
 
 ### 实盘的持久化在哪
 
-实盘没有「现金」概念，权益永远从交易所读。`robots.state_json` 里存：`liveLegs`（机器人自己的仓位账本）、`condOrders`（已挂保护单快照，用于差量同步）、`anchorPrice`、`realizedPnl`（下次 tick 才并入资金基数）、`manualNotice`（手动仓提示节流）、`equity` / `balance` / `positions`（最近一次读到的交易所状态，给前端渲染）。
+实盘没有「现金」概念，权益永远从交易所读。`robots.state_json` 里存：`liveLegs`（机器人持仓账本，接管模式下已含交易所原有仓位）、`takeover`（接管状态：`{long:{qty,entryPrice,at}|null, short:...}`，该方向仓归零后自动清空）、`takeoverNotice`（接管提示节流）、`condOrders`（已挂保护单快照，用于差量同步）、`anchorPrice`、`realizedPnl`（下次 tick 才并入资金基数）、`equity` / `balance` / `positions`（最近一次读到的交易所状态，给前端渲染）。
 
 ---
 
@@ -294,7 +294,7 @@ robots.paper_json（每机器人一份，机器人级）
 `makeClientId(robotId, side, layer, action, bucketMs = 300000)` 用机器人 id + 方向 + 层号 + 动作 + 5 分钟时间桶拼出来，不做随机。理由是网络超时这个真实场景：请求发出去了、响应没回来，到底成没成交不知道。随机 id 会在下一 tick 重发时**真的再开一仓**；确定性 id 重发会被币安按重复 `clientOrderId` 拒掉（`-4015` / `-4116`），再按 id 回查（`recoverByClientId`）就知道第一笔已成交。同理 `rest.js` **只对 `GET` 与撤单 `DELETE` 重试，下单 `POST` 绝不自动重试**——超时不等于没成交。
 
 **2. 实盘独立持仓账本 `liveLegs`**
-币安 U 本位双向持仓下，同一 symbol 的多头是**账户级聚合**的：`positionRisk` 只告诉你「这个币有多单 4.37 张」，分不清哪几笔是机器人开的。直接把整段当自己的，用户手动开的仓会被机器人平掉——这是真金白银的事故。所以每台实盘机器人在 `state_json.liveLegs` 记自己的账本：开仓成功 `addLeg`，平仓按数量 `drainQty` / `drainLegs`，每 tick `reconcile` 对账——交易所**多**出来的是手动仓（只提示、绝不动），**少**了就按比例缩减。账本只用来算层数、均价、可平数量；**权益永远取交易所真实值**。
+币安 U 本位双向持仓下，同一 symbol 的多头是**账户级聚合**的：`positionRisk` 只告诉你「这个币有多单 4.37 张」，分不清哪几笔是机器人开的。早期方案是「只认自己账本、多出来的当手动仓不碰」，结果会出现「账户大仓、机器人小仓」以及手动平仓后机器人账本静默归零再重复建仓的事故。**1.0.2 起改成接管模式**：每台实盘机器人在 `state_json.liveLegs` 记账本，开仓成功 `addLeg`，平仓按数量 `drainQty` / `drainLegs`，每 tick `reconcile` 对账——交易所**多**出来的仓位全部接管进账本（入场价用增量反解，保证账本加权均价 = 交易所真实均价），**少**了就按比例缩减。接管方向不加仓，按真实均价算出的止盈价到了一次性整边全平，平完才重建第一层。账本只用来算层数、均价、可平数量；**权益永远取交易所真实值**。
 
 **3. 时间戳偏移校准**
 签名请求的 `timestamp` 必须落在 `recvWindow` 内，否则报 `-1021`。经反向代理时单程可能几百毫秒到数秒，本地时钟也可能偏。`rest.js` 的 `syncTime()` 请求 `/fapi/v1/time`，用**往返中点**估出 `timeOffsetMs`，之后一律 `Date.now() + offset`；`startTimeSync()` 每 60 秒（`BINANCE_TIME_SYNC_MS`，夹 10s~600s）重新校准；遇 `-1021` / `-1022` 还会强制重同步后重试一次。`recvWindow` 默认 5000ms，`BINANCE_RECV_WINDOW` 可在 1000~60000 调整。
@@ -321,9 +321,10 @@ robots.paper_json（每机器人一份，机器人级）
 | `test-capital.mjs` | 10 | 仓位按 `allocatedCapital` 算而非账户权益；资金太小判不可行；加仓累计占用不超预算；跌到间距才加仓且均价被摊低；锚点固定时阶梯一致；资金基数 = 分配资金 + 已实现盈亏；亏光后归零不变负；收益并入基数后阶梯同步放大；`decide` 透传 `realizedPnl` |
 | `test-minqty.mjs` | 8 | 「名义够但数量摊不到一个最小台阶」的边界：`requiredQtyUnits` / `qtyUnitsOf` / `minOrderNotional` / `canPlaceNotional`；粗步长标的上判不可行并给中文提示；正好一个台阶时可行；BTC 仍按名义门槛主导；`decide` 资金不足不下单 |
 | `test-precision.mjs` | 12 | 精度规则：股票类永续（`TRADIFI_PERPETUAL`）必须被当作可交易；交割与停止交易的排除；`parseFilters` 解析真实过滤器；`MARKET_LOT_SIZE` 更粗时取粗、没有就退回 `LOT_SIZE`；降精度候选只在名义仍够时给出；条件单数量与触发价同步降精度；`fmtPrice` 按 `tickSize` 四舍五入；`stepSize=1` 取整；科学计数法步长 |
-| `test-protect.mjs` | 10 | 保护单意图：`avg` 模式整边一对、`layer` 模式每笔一个止盈且止损只有一个、空单方向相反、止损夹在入场与强平之间、名义不足进 `skipped`、无持仓不产单、`diffCondOrders` 同 id 不重发 / 触发价变了撤旧挂新 / 交易所已消失的清理、`normalizeCondOrders` 兼容两种历史结构 |
+| `test-protect.mjs` | 11 | 保护单意图：`avg` 模式整边一对、`layer` 模式每笔一个止盈且止损只有一个、接管模式下强制整边一张、空单方向相反、止损夹在入场与强平之间、名义不足进 `skipped`、无持仓不产单、`diffCondOrders` 同 id 不重发 / 触发价变了撤旧挂新 / 交易所已消失的清理、`normalizeCondOrders` 兼容两种历史结构 |
 | `test-protection.mjs` | 6 | 从币安**真实挂单**识别止盈止损的方向语义；无挂单时 `source='none'` 且价格返回 0（平台不应自己编价格）；`clampStopToLiq` 把翻到错误一侧的止损拉回来 |
-| `test-livebook.mjs` | 10 | `liveLegs` 账本：累加与加权均价、脏数据不入账、三方对账（多出→手动仓 / 少→按比例缩减 / 全平→清零）、按数量扣减时均价不变、逐笔平仓只扣指定几笔、`bookOf` 结构、`parseLiveLegs` 容错、`filterBySymbol` 只留本交易对 |
+| `test-livebook.mjs` | 13 | `liveLegs` 账本：累加与加权均价、脏数据不入账、三方对账（多出→全部接管 / 少→按比例缩减 / 全平→清零）、按数量扣减时均价不变、逐笔平仓只扣指定几笔、`bookOf` 结构、`parseLiveLegs` 容错、`filterBySymbol` 只留本交易对 |
+| `test-takeover.mjs` | 9 | 接管模式：`takeoverSides` 判空、接管期间不加仓（带对照组）、`tpMode=layer` 也整边全平、止盈价按交易所真实均价、接管仓仍受硬止损、平完后重建第一层、对账增量反解均价、`stepSize/2` 对账容差 |
 
 ```bash
 node scripts/check.js        # 语法自检

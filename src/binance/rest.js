@@ -373,6 +373,43 @@ export function newOrder(credentials, order) {
 }
 
 /**
+ * 新 Algo 条件单（STOP_MARKET / TAKE_PROFIT_MARKET 等）。
+ *
+ * 为什么必须走这个端点：币安已不再接受用 /fapi/v1/order 提交 STOP_MARKET /
+ * TAKE_PROFIT_MARKET，会直接报
+ *   Order type not supported for this endpoint. Please use the Algo Order API endpoints instead.
+ * 结果就是实盘机器人交易所侧一张止损单都没有（只能靠 5 秒 tick 的软件止损）。
+ * 字段名与 /fapi/v1/order 不同：triggerPrice（不是 stopPrice）、clientAlgoId（不是 newClientOrderId），
+ * 并且必须带 algoType=CONDITIONAL。
+ */
+export function newAlgoOrder(credentials, order) {
+  return signedPost('/fapi/v1/algoOrder', order, credentials);
+}
+
+/** 当前开放的 Algo 条件单（需要签名） */
+export function openAlgoOrders(credentials, symbol) {
+  const q = { algoType: 'CONDITIONAL' };
+  if (symbol) q.symbol = symbol;
+  return signedGet('/fapi/v1/openAlgoOrders', q, credentials);
+}
+
+/** 撤 Algo 条件单（algoId 或 clientAlgoId 二选一） */
+export function cancelAlgoOrder(credentials, { algoId, clientAlgoId } = {}) {
+  const form = {};
+  if (algoId != null) form.algoId = algoId;
+  if (clientAlgoId) form.clientAlgoId = clientAlgoId;
+  return signedDelete('/fapi/v1/algoOrder', form, credentials);
+}
+
+/** 查单个 Algo 条件单（按 algoId 或 clientAlgoId） */
+export function queryAlgoOrder(credentials, { algoId, clientAlgoId } = {}) {
+  const q = {};
+  if (algoId != null) q.algoId = algoId;
+  if (clientAlgoId) q.clientAlgoId = clientAlgoId;
+  return signedGet('/fapi/v1/algoOrder', q, credentials);
+}
+
+/**
  * 撤单（需要签名）。
  * 可以按 exchange orderId 撤，也可以按 origClientOrderId 撤（二者传一个）。
  */

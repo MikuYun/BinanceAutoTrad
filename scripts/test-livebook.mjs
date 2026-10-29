@@ -15,9 +15,9 @@ import {
   ownAvgEntry,
   bookOf,
   filterBySymbol,
-  snapshotBaseline,
-  parseBaseline,
-  hasBaseline,
+  parseTakeover,
+  emptyTakeover,
+  takeoverSides,
 } from '../src/strategy/liveBook.js';
 
 test('账本累加与加权均价', () => {
@@ -36,95 +36,87 @@ test('非法数据不进入账本', () => {
   assert.equal(legs.long.length, 0);
 });
 
-test('对账：交易所数量 > 账本数量时，多出来的是手动仓', () => {
-  const legs = emptyLiveLegs();
-  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
-  const rec = reconcile(legs, [{ side: 'long', qty: 4, entryPrice: 99.5 }]);
-  assert.equal(rec.own.long.qty, 1);
-  assert.equal(rec.manual.long, 3);
-  assert.equal(rec.clamped.long, undefined);
+test('对账：交易所比账本多 → 多出来的部分全部接管进账本', () => {
+  const book = emptyLiveLegs();
+  addLeg(book, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
+  // 机器人账本 1 张 @100，交易所 4 张 @99.5（其中 3 张是用户手动开的/上一版漏记的）
+  const rec = reconcile(book, [{ side: 'long', qty: 4, entryPrice: 99.5 }]);
+  assert.equal(rec.adopted.long, 3);
+  assert.equal(rec.drained.long, undefined);
+  assert.equal(rec.missing.long, undefined);
+  // 接管后账本数量必须等于交易所数量
+  assert.equal(ownQty(book, 'long'), 4);
+  // 关键：账本加权均价必须等于交易所真实均价，否则止盈价不是「实际止盈价」
+  assert.ok(Math.abs(ownAvgEntry(book, 'long') - 99.5) < 1e-9);
+  // 全部都是接管来的 → 进入接管模式
+  assert.ok(rec.takeover.long);
+  assert.equal(rec.takeover.long.qty, 4);
+  // 另一个方向没有仓 → 不是接管模式
+  assert.equal(rec.takeover.short, null);
 });
 
-test('对账：用户手动平掉一部分，账本按比例缩减而不是消失', () => {
+test('对账：账本为空但交易所有仓 → 全部接管（事故修复的核心）', () => {
+  // 事故现场：机器人重复下单把交易所加到 0.7 张，账本是 0 张。
+  const legs = emptyLiveLegs();
+  const rec = reconcile(legs, [{ side: 'long', qty: 0.7, entryPrice: 976.11 }]);
+  assert.ok(Math.abs(rec.adopted.long - 0.7) < 1e-9);
+  assert.ok(Math.abs(ownQty(legs, 'long') - 0.7) < 1e-9);
+  assert.ok(Math.abs(ownAvgEntry(legs, 'long') - 976.11) < 1e-9);
+  assert.equal(rec.takeover.long.qty, 0.7);
+});
+
+test('对账：部分接管时账本里机器人自己的笔不受影响，但整边进入接管模式', () => {
+  const legs = emptyLiveLegs();
+  addLeg(legs, 'long', { id: 'mine', qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
+  const rec = reconcile(legs, [{ side: 'long', qty: 2, entryPrice: 99 }]);
+  const mine = legs.long.find((l) => l.id === 'mine');
+  assert.ok(mine);
+  assert.equal(mine.qty, 1);
+  assert.equal(mine.entryPrice, 100);
+  // 用户 m06852：「机器人接管这一个币的所有仓位」——只要监控到有非机器人仓，
+  // 整个方向就进入接管模式：等实际止盈价一次性全平，中途不加仓。
+  assert.ok(rec.takeover.long);
+  assert.ok(Math.abs(rec.takeover.long.qty - 2) < 1e-9);
+  assert.ok(Math.abs(ownAvgEntry(legs, 'long') - 99) < 1e-9);
+});
+
+test('对账：有人手动减仓 → 账本按比例缩减，均价不变', () => {
   const legs = emptyLiveLegs();
   addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
   addLeg(legs, 'long', { qty: 1.5, entryPrice: 99, leverage: 20, layer: 2 });
   const avgBefore = ownAvgEntry(legs, 'long');
-  const rec = reconcile(legs, [{ side: 'long', qty: 2 }]);
-  assert.ok(rec.clamped.long > 0);
+  const rec = reconcile(legs, [{ side: 'long', qty: 2, entryPrice: avgBefore }]);
+  assert.ok(rec.drained.long > 0);
   assert.ok(Math.abs(ownQty(legs, 'long') - 2) < 1e-9);
-  // 缩减不能改变均价
   assert.ok(Math.abs(ownAvgEntry(legs, 'long') - avgBefore) < 1e-9);
 });
 
-test('对账：用户把仓位全平了，账本清零，并标记 missing 让上层写警告', () => {
+test('对账：交易所归零但账本里还有 → 清账本并标 missing', () => {
   const legs = emptyLiveLegs();
   addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
   const rec = reconcile(legs, [{ side: 'long', qty: 0 }]);
   assert.equal(ownQty(legs, 'long'), 0);
   assert.equal(rec.own.long.qty, 0);
-  assert.ok(rec.clamped.long > 0);
-  // missing=true 表示「交易所归零但账本里还有机器人的仓」= 用户手动把含机器人那份全平了
   assert.equal(rec.missing.long, true);
+  assert.equal(rec.takeover.long, null);
 });
 
-test('手动仓基准：快照 / 解析 / 判空', () => {
-  const b = snapshotBaseline([
-    { side: 'long', qty: 10, entryPrice: 100 },
-    { side: 'short', qty: 3, entryPrice: 101 },
-  ]);
-  assert.equal(b.long, 10);
-  assert.equal(b.short, 3);
-  assert.ok(b.at > 0);
-  assert.equal(hasBaseline(b), true);
-  assert.equal(hasBaseline({ long: 0, short: 0 }), false);
-  assert.equal(hasBaseline(null), false);
-
-  const parsed = parseBaseline({ manualBaseline: b });
-  assert.equal(parsed.long, 10);
-  assert.equal(parsed.short, 3);
-  // 容错：没有 state / 没有字段 / 脏数据都要返回 0
-  const none = parseBaseline(null);
-  assert.equal(none.long, 0);
-  assert.equal(none.short, 0);
-  const dirty = parseBaseline({ manualBaseline: { long: 'x', short: NaN } });
-  assert.equal(dirty.long, 0);
-  assert.equal(dirty.short, 0);
-});
-
-test('对账：有手动仓基准时，先扣掉基准再算机器人可认领的量', () => {
-  const legs = emptyLiveLegs();
-  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
-  // 用户原本就有 10 张，机器人自己又开了 1 张 → 交易所 11 张
-  const baseline = { long: 10, short: 0, at: Date.now() };
-  const rec = reconcile(legs, [{ side: 'long', qty: 11 }], baseline);
-  // 扣掉基准 10 后剩 1 = 机器人自己的，没有被误认为手动仓，也没被缩减
-  assert.equal(rec.own.long.qty, 1);
-  assert.equal(rec.manual.long, 0);
-  assert.equal(rec.clamped.long, undefined);
-  assert.equal(rec.missing.long, undefined);
-});
-
-test('对账：有基准时用户把「包含机器人那份」全平掉 → 账本清零并标 missing', () => {
-  const legs = emptyLiveLegs();
-  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
-  const baseline = { long: 10, short: 0, at: Date.now() };
-  // 用户把 11 张全平了 → 交易所归零，扣掉基准后也是 0
-  const rec = reconcile(legs, [{ side: 'long', qty: 0 }], baseline);
-  assert.equal(ownQty(legs, 'long'), 0);
-  assert.equal(rec.missing.long, true);
-});
-
-test('对账：有基准时用户只平掉自己的手动仓 → 机器人账本必须原封不动', () => {
-  const legs = emptyLiveLegs();
-  addLeg(legs, 'long', { qty: 1, entryPrice: 100, leverage: 20, layer: 1 });
-  const baseline = { long: 10, short: 0, at: Date.now() };
-  // 用户平掉自己的 10 张，交易所只剩机器人的 1 张
-  const rec = reconcile(legs, [{ side: 'long', qty: 1 }], baseline);
-  assert.equal(rec.clamped.long, undefined);
-  assert.equal(rec.missing.long, undefined);
-  assert.equal(ownQty(legs, 'long'), 1);
-  assert.equal(rec.manual.long, 0);
+test('接管块：解析容错 + 判定', () => {
+  assert.deepEqual(parseTakeover(null), { long: null, short: null });
+  const t = parseTakeover({
+    takeover: {
+      long: { qty: 3, entryPrice: 100, at: 123 },
+      short: { qty: 0, entryPrice: 0 },
+    },
+  });
+  assert.equal(t.long.qty, 3);
+  assert.equal(t.long.entryPrice, 100);
+  assert.equal(t.short, null);
+  // 脏数据
+  const dirty = parseTakeover({ takeover: { long: { qty: 'x', entryPrice: 'y' } } });
+  assert.equal(dirty.long, null);
+  assert.deepEqual(takeoverSides(null), { long: false, short: false });
+  assert.deepEqual(takeoverSides(t), { long: true, short: false });
 });
 
 test('平仓按数量扣减，均价不变，数量扣不完就扣到 0', () => {

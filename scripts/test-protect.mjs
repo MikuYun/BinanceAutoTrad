@@ -140,3 +140,19 @@ test('normalizeCondOrders：兼容扁平数组与按 side 分组两种历史结�
   assert.equal(grouped.find((x) => x.id === 'x2').side, 'long');
   assert.equal(grouped.find((x) => x.id === 'x3').side, 'short');
 });
+
+test('接管模式下即使 tpMode=layer，止盈也只挂一张整边的（用户 m06852 要求）', () => {
+  // 两笔：一笔是机器人开的（layer 1），一笔是接管来的
+  const own = leg(0.1, 100, 1);
+  const tk = { id: 'l9', qty: 0.3, entryPrice: 95, layer: 1, source: 'takeover' };
+  const legs = { long: [own, tk], short: [] };
+  const { orders } = desiredCondOrders({
+    robotId: 'r9', legs, params: { tpMode: 'layer', tpPct: 1, stopPct: 5 },
+    price: 96, equity: 1000, rules: RULES, fns,
+  });
+  const tps = orders.filter((o) => o.type === 'tp');
+  assert.equal(tps.length, 1, '接管期间只能有 1 张整边止盈单，不能逐笔挂');
+  // 整边均价 = (0.1*100 + 0.3*95) / 0.4 = 96.25 → 止盈 97.2125
+  assert.ok(Math.abs(tps[0].triggerPrice - 97.2125) < 1e-6, '止盈价要按整边真实均价算');
+  assert.ok(Math.abs(tps[0].quantity - 0.4) < 1e-9, '数量必须是整边全量（含接管那份）');
+});

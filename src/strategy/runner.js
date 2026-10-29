@@ -17,16 +17,39 @@ import { getMarketFeed, getExchange, loadCredentials } from '../binance/index.js
 import { recordAccountEquity } from './accountStats.js';
 import {
   emptyLiveLegs, parseLiveLegs, addLeg, drainQty, drainLegs, reconcile, bookOf,
-  ownQty, ownAvgEntry, filterBySymbol, parseBaseline,
+  ownQty, ownAvgEntry, filterBySymbol, parseTakeover, emptyTakeover,
 } from './liveBook.js';
 import { tpTargetFor, stopTargetFor, liqPrice } from './solver.js';
 import { desiredCondOrders, diffCondOrders, normalizeCondOrders } from './protect.js';
 import {
-  makeClientId, placeConditional, cancelByClientId, fetchOpenOrders, fetchAccount,
+  makeClientId, placeConditional, cancelByClientId, fetchAllOpenOrders, fetchAccount,
 } from '../binance/live.js';
 
 /** 每个机器人的 tick 间隔 */
 const TICK = { intervalMs: PAPER.tickIntervalMs };
+
+/** 实盘连续下单错误计数：达到阈值就自动停机（P0-5） */
+const ORDER_ERROR_LIMIT = 3;
+const orderErrors = new Map();
+
+function markOrderError(entry) {
+  const n = (orderErrors.get(entry.robotId) || 0) + 1;
+  orderErrors.set(entry.robotId, n);
+  if (n < ORDER_ERROR_LIMIT) return;
+  orderErrors.delete(entry.robotId);
+  logEvent(
+    entry.userId,
+    entry.robotId,
+    'error',
+    `实盘连续 ${ORDER_ERROR_LIMIT} 次下单/执行失败，机器人已自动停止。请排查后重新启动。`,
+  );
+  saveRobot(entry.robotId, { status: 'stopped', started_at: null });
+  stopRobot(entry.robotId);
+}
+
+function clearOrderErrors(robotId) {
+  orderErrors.delete(robotId);
+}
 
 /** robotId -> { timer, robot, params, mode, userId, symbol } */
 const running = new Map();
@@ -77,10 +100,15 @@ function saveRobot(robotId, patch) {
 function recordOrder(userId, robotId, symbol, o) {
   const id = randomId('o');
   const ts = Date.now();
+  // P0-1（docs/BUGFIX-PLAN-client-order-id-unique.md）：
+  // client_id 撞唯一约束，绝对不能抛异常。上一版就是抛在这里，导致
+  // 「交易所已成交、账本没记上」，下一 tick 以为没建仓又发一笔 → 重复开仓。
+  // 同一个 client_id 就是同一笔意图，撞了当作已记录直接忽略。
   run(
     `INSERT INTO orders (id, user_id, robot_id, client_id, symbol, side, type, qty, price,
       avg_price, status, reduce_only, reason, fee, realized_pnl, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(client_id) DO NOTHING`,
     id,
     userId,
     robotId,
@@ -166,8 +194,8 @@ async function tick(entry) {
   if (mode === 'live') warnDegradedRules(userId, robotId, symbol, rules);
 
   let book = null;
-  let legs = null; // 实盘：机器人自己的持仓账本（与用户手动仓隔离）
-  let manualBaseline = null; // 实盘：用户在创建时选择「保留」的手动仓基准
+  let legs = null; // 实盘：机器人自己的持仓账本（含接管来的部分）
+  let takeover = null; // 实盘：本次 tick 为止仍未平掉的接管仓位（这些方向只等止盈全平，不加仓）
   let wallet = null;
   let cashBefore = 0;
   let pnlBefore = 0;
@@ -183,7 +211,7 @@ async function tick(entry) {
   let quote = null;
   let equity = 0;
   let liveRealizedDelta = 0; // 本次 tick 里实盘平仓带来的已实现盈亏（累加到 state.realizedPnl）
-  let liveManualNotice = null; // 手动仓位提示的节流状态
+  let liveNotice = null; // 接管仓位提示的节流状态
   let condNext = null; // 实盘保护单（止盈/止损）同步后的账本
   let condWarn = ''; // 保护单没挂上的原因（避免每 5 秒刷一条事件）
 
@@ -214,60 +242,60 @@ async function tick(entry) {
       saveRobot(robotId, { last_error: e.message });
       return;
     }
-    // 关键：币安双向持仓模式下同一个 symbol 的多头是账户级聚合的，
-    // positionRisk 分不清「机器人开的」和「用户手动开的」。
-    // 这里用机器人自己的账本（state_json.liveLegs）与交易所对账，
-    // 机器人只认自己那部分，绝不碰用户手动开的仓位。
+    // 【接管模式】（用户 m06852 要求）
+    // 机器人一旦启动，就接管这个交易对在交易所里的全部仓位。
+    // 交易所是唯一真相源：
+    //   · 交易所比账本多 → 多出来的部分接管进账本，均价用「交易所总名义 − 账本已有名义」反解，
+    //     保证账本加权均价恰好等于交易所真实均价；
+    //   · 交易所比账本少 → 有人手动减仓，按比例缩减账本；
+    //   · 交易所已经空了 → 清空该方向账本。
+    // 接管来的仓位不再加仓，只等「按真实均价算出的止盈价」一次性全平，平完再重新建第一层。
     const prevState = parseJson(row.state_json, null) || {};
     legs = parseLiveLegs(prevState);
-    // 用户创建机器人时如果选择「保留已有持仓」，这里存着那部分手动仓的基准数量。
-    // 对账时必须先扣掉基准，剩下的才算机器人可认领的量——否则用户原有的仓
-    // 会被当成机器人的仓去算层数/均价，甚至在用户手动平仓后触发「重建大仓」。
-    const baseline = parseBaseline(prevState);
-    manualBaseline = baseline;
-    const rec = reconcile(legs, quote.positions, baseline);
+    const prevTakeover = parseTakeover(prevState);
+    const rec = reconcile(legs, quote.positions, prevTakeover, rules);
     legs = rec.legs;
+    takeover = rec.takeover;
     // 日志节流：只在「首次发现」或「数量变化」时写事件，否则每 5 秒一条会刷屏
-    const prevNotice = prevState.manualNotice || {};
+    const prevNotice = prevState.takeoverNotice || {};
     const notice = {};
     for (const side of ['long', 'short']) {
       const sideName = side === 'long' ? '多' : '空';
       if (rec.missing && rec.missing[side]) {
-        // 账本里还有机器人的仓，但交易所对应方向已经空了：
-        // 只可能是用户手动把这个方向的仓（含机器人那份）全平了。
-        // 必须明确告诉用户「机器人的仓被你平掉了」，而不是静默清账本重开。
         logEvent(
           userId,
           robotId,
           'warn',
-          `对账：${sideName}单在交易所已归零，但机器人账本里还有 ${Number(rec.clamped[side] || 0).toFixed(6)} 张。`
-            + '说明你手动把这个方向的仓（含机器人的部分）平掉了，机器人已同步清空该方向账本；'
-            + '如果这不是你要的结果，请停止机器人后使用「重置」重建账本。',
+          `对账：${sideName}单在交易所已归零，机器人账本也同步清空。`
+            + '下一次 tick 会重新建第一层。',
         );
-      } else if (rec.clamped[side] > 1e-12) {
+      } else if (rec.drained && rec.drained[side] > Math.max(Number(rules.stepSize) / 2, 1e-8)) {
         logEvent(
           userId,
           robotId,
           'warn',
-          `对账：${sideName}单在交易所少了 ${Number(rec.clamped[side]).toFixed(6)} 张`
-            + '（可能是手动平掉了部分仓位），机器人账本已同步缩减',
+          `对账：${sideName}单在交易所少了 ${Number(rec.drained[side]).toFixed(6)} 张`
+            + '（有人手动减了仓），机器人账本已同步缩减',
         );
       }
-      const mq = rec.manual[side];
-      if (mq > 1e-9) {
-        const key = mq.toFixed(6);
+      const aq = rec.adopted && rec.adopted[side];
+      if (aq > 1e-9) {
+        const key = aq.toFixed(6);
         if (prevNotice[side] !== key) {
+          const avgT = ownAvgEntry(legs, side);
+          const tpT = tpTargetFor(side, avgT, params);
           logEvent(
             userId,
             robotId,
             'info',
-            `检测到 ${sideName}单有 ${mq.toFixed(6)} 张非机器人仓位（手动仓），机器人不会动它`,
+            `接管：${sideName}单已有 ${aq.toFixed(6)} 张不是机器人开的仓位，已全部接管`
+              + `（实际均价 ${avgT.toFixed(6)}）。接管仓位不加仓，等止盈价 ${tpT.toFixed(6)} 一次性全平。`,
           );
         }
         notice[side] = key;
       }
     }
-    liveManualNotice = notice;
+    liveNotice = notice;
     book = bookOf(legs);
   }
 
@@ -311,6 +339,7 @@ async function tick(entry) {
     quote,
     anchorPrice,
     realizedPnl: ownRealizedPnl,
+    takeover,
   });
 
   for (const note of result.notes || []) logEvent(userId, robotId, 'info', note);
@@ -347,6 +376,10 @@ async function tick(entry) {
           condWarn0 = sync0.warn || '';
           condNext = sync0.next;
           condWarn = sync0.warn || '';
+          // 保护单挂不上是高风险：交易所侧裸仓，只能靠软件止损。必须留 error 级事件。
+          if (sync0.severe) {
+            logEvent(userId, robotId, 'error', `保护单异常：${sync0.severe}`);
+          }
           if (sync0.changed) {
             logEvent(userId, robotId, 'info',
               `实盘止盈止损单已同步：新挂 ${sync0.placed} 个，撤销 ${sync0.canceled} 个`
@@ -364,8 +397,8 @@ async function tick(entry) {
           short: pos0.filter((x) => x.side === 'short'),
         },
         liveLegs: legs,
-        manualBaseline,
-        manualNotice: liveManualNotice || st0.manualNotice || {},
+        takeover,
+        takeoverNotice: liveNotice || st0.takeoverNotice || {},
         condOrders: cond0,
         condWarn: condWarn0,
         condSyncedAt: condNext ? Date.now() : Number(st0.condSyncedAt || 0),
@@ -478,7 +511,42 @@ async function tick(entry) {
         const creds = loadCredentials(userId);
         if (!creds) continue;
         if (act.type === 'open') {
+          // P0-6：账本为空但交易所已经有这个方向的仓 —— 绝对不能开仓。
+          // 否则就重现事故：账本 0、交易所已经有仓，每一 tick 都以为自己是空仓，
+          // 反复开第一笔，把交易所真实仓位越推越大。
+          const exPos0 = (quote.positions || []).find((x) => x.side === act.side);
+          const exQty0 = Number((exPos0 || {}).qty) || 0;
+          if (exQty0 > 0 && ownQty(legs, act.side) <= 1e-12) {
+            logEvent(
+              userId,
+              robotId,
+              'warn',
+              `拒绝开仓：交易所 ${act.side === 'long' ? '多' : '空'}单已有 ${exQty0} 张，`
+                + '但机器人账本为空。等下一个 tick 接管完成后再操作。',
+            );
+            continue;
+          }
           const qty = act.notional / price;
+          // P0-3：意图序号取「本机器人已记录订单数 + 1」，重启后依然可复现；
+          // 同一意图重试得到同一 id（幂等），不同意图必然不同。
+          const opSeq = Number((get('SELECT COUNT(*) AS c FROM orders WHERE robot_id = ?', robotId) || {}).c || 0) + 1;
+          const opCid = makeClientId(robotId, act.side, act.layer, 'op', opSeq);
+          // P0-4：下单前本地查重。这条 clientOrderId 如果已经落库为成交，
+          // 说明上一轮其实已经下成、只是没走到 addLeg 就出错了，直接发会把同一笔重复成交。
+          const dup = get('SELECT * FROM orders WHERE client_id = ?', opCid);
+          if (dup && String(dup.status || '').toUpperCase() === 'FILLED') {
+            addLeg(legs, act.side, {
+              qty: Number(dup.qty) || 0,
+              entryPrice: Number(dup.avg_price || dup.price) || price,
+              leverage: Number(params.leverage) || 1,
+              layer: act.layer,
+              clientId: opCid,
+              reason: act.reason,
+            });
+            logEvent(userId, robotId, 'warn',
+              `跳过重复下单：${opCid} 已成交（${dup.qty} 张 @ ${dup.avg_price || dup.price}），已直接补记账本`);
+            continue;
+          }
           const res = await exchange.placeOrder(creds, {
             symbol,
             side: act.side === 'long' ? 'BUY' : 'SELL',
@@ -487,47 +555,54 @@ async function tick(entry) {
             quantity: qty,
             price,
             rules,
-            clientOrderId: makeClientId(robotId, act.side, act.layer, 'op'),
+            clientOrderId: opCid,
           });
-          recordOrder(userId, robotId, symbol, {
-            side: act.side === 'long' ? 'BUY' : 'SELL',
-            qty: Number(res.executedQty) || qty,
-            price: Number(res.avgPrice) || price,
-            avgPrice: Number(res.avgPrice) || price,
-            clientId: res.clientOrderId,
-            reason: act.reason,
-            status: res.status || 'FILLED',
-          });
-          // 记进机器人自己的账本，之后只认这几笔
+          const filledQty = Number(res.executedQty) || qty;
+          const avgPrice = Number(res.avgPrice) || price;
+          // P0-2：先写账本（内存），再记账（DB）。
+          // 上一版先 recordOrder 后 addLeg：recordOrder 抛 UNIQUE 时账本没记上，
+          // 交易所却已成交 → 身份丢失 → 重复开仓。顺序颠倒后即使记账失败，
+          // 账本也是准的，下一 tick 就能正常接管/平仓。
           addLeg(legs, act.side, {
-            qty: Number(res.executedQty) || qty,
-            entryPrice: Number(res.avgPrice) || price,
+            qty: filledQty,
+            entryPrice: avgPrice,
             leverage: Number(params.leverage) || 1,
             layer: act.layer,
             clientId: res.clientOrderId,
             reason: act.reason,
+          });
+          recordOrder(userId, robotId, symbol, {
+            side: act.side === 'long' ? 'BUY' : 'SELL',
+            qty: filledQty,
+            price: avgPrice,
+            avgPrice,
+            clientId: res.clientOrderId,
+            reason: act.reason,
+            status: res.status || 'FILLED',
           });
           logEvent(
             userId,
             robotId,
             'trade',
             `实盘开${act.side === 'long' ? '多' : '空'} 第 ${act.layer} 层：`
-              + `${Number(res.executedQty) || qty} 张 @ ${Number(res.avgPrice) || price}`,
+              + `${filledQty} 张 @ ${avgPrice}`,
           );
+          clearOrderErrors(robotId);
         } else if (act.type === 'close') {
-          // 只平机器人自己账本里的那部分数量，绝不动用户手动开的仓
+          // 接管模式下账本 = 交易所该方向全部数量（含接管来的），所以平仓就是全平。
           const myQty = ownQty(legs, act.side);
           if (!(myQty > 0)) {
             logEvent(
               userId,
               robotId,
               'warn',
-              `${act.side === 'long' ? '多' : '空'}单账本为空（可能是手动仓位），跳过平仓`,
+              `${act.side === 'long' ? '多' : '空'}单账本为空，跳过平仓`,
             );
             continue;
           }
           const exQty = Number(((quote.positions || []).find((x) => x.side === act.side) || {}).qty) || 0;
           const closeQty = Math.min(myQty, exQty > 0 ? exQty : myQty);
+          const clSeq = Number((get('SELECT COUNT(*) AS c FROM orders WHERE robot_id = ?', robotId) || {}).c || 0) + 1;
           const res = await exchange.placeOrder(creds, {
             symbol,
             side: act.side === 'long' ? 'SELL' : 'BUY',
@@ -537,7 +612,7 @@ async function tick(entry) {
             price,
             rules,
             reduceOnly: true,
-            clientOrderId: makeClientId(robotId, act.side, 0, 'cl'),
+            clientOrderId: makeClientId(robotId, act.side, 0, 'cl', clSeq),
           });
           const filledQty = Number(res.executedQty) || closeQty;
           const avgPrice = Number(res.avgPrice) || price;
@@ -574,6 +649,9 @@ async function tick(entry) {
       }
     } catch (e) {
       logEvent(userId, robotId, 'error', `执行 ${act.type} ${act.side} 失败：${(e && e.message) || e}`);
+      // P0-5：实盘连续下单错误自动熔断。
+      // 事故时 36 次 UNIQUE 异常只写了事件、机器人继续跑 5 秒一拍，越亏越大。
+      if (mode === 'live' && act.type !== 'close') markOrderError(entry);
     }
   }
 
@@ -588,6 +666,10 @@ async function tick(entry) {
       });
       condNext = sync1.next;
       condWarn = sync1.warn || '';
+      // 保护单挂不上是高风险：交易所侧裸仓，只能靠软件止损。必须留 error 级事件。
+      if (sync1.severe) {
+        logEvent(userId, robotId, 'error', `保护单异常：${sync1.severe}`);
+      }
       if (sync1.changed) {
         logEvent(userId, robotId, 'info',
           `实盘止盈止损单已同步：新挂 ${sync1.placed} 个，撤销 ${sync1.canceled} 个`
@@ -670,8 +752,8 @@ async function tick(entry) {
         short: ownPositions.filter((x) => x.side === 'short'),
       },
       liveLegs: legs,
-      manualBaseline,
-      manualNotice: liveManualNotice || st.manualNotice || {},
+      takeover,
+      takeoverNotice: liveNotice || st.takeoverNotice || {},
       condOrders: condNext || normalizeCondOrders(st.condOrders),
       condWarn: condWarn !== '' ? condWarn : (st.condWarn || ''),
       condSyncedAt: condNext ? Date.now() : Number(st.condSyncedAt || 0),
@@ -758,7 +840,9 @@ async function syncProtection(p) {
 
   let open = null;
   try {
-    open = await fetchOpenOrders(creds, symbol);
+    // 普通挂单 + Algo 条件单 一起取：保护单现在挂在 Algo 端点上，
+    // 只看 /fapi/v1/openOrders 会以为它们都「消失了」，导致每轮撤了重挂。
+    open = await fetchAllOpenOrders(creds, symbol);
   } catch (e) {
     // 拿不到挂单列表就什么都不动（宁可多留一条旧单，也不能盲掸）
     out.warn = `读取挂单失败：${(e && e.message) || e}`;
@@ -802,7 +886,9 @@ async function syncProtection(p) {
       if (res) {
         placed.push({
           ...want,
-          orderId: res.orderId || res.order_id || 0,
+          // Algo 单的订单号字段是 algoId（普通单才是 orderId），两个都取
+          orderId: res.algoId || res.orderId || res.order_id || 0,
+          algoId: res.algoId || 0,
           placedAt: Date.now(),
         });
         out.placed += 1;
@@ -816,6 +902,15 @@ async function syncProtection(p) {
   const canceledIds = new Set(toCancel.map((x) => x.id));
   out.next = [...prev.filter((x) => !canceledIds.has(x.id)), ...placed];
   out.changed = Boolean(out.canceled || out.placed);
+
+  // 保护单挂不上的严重性：事故期间交易所侧真的是一张止损单都没有（只靠 5 秒 tick 的软件止损），
+  // 所以挂单失败不能只安静地存在 state_json 里，必须留一条 error 级事件。
+  if (out.failed > 0) {
+    out.severe = `止盈/止损单有 ${out.failed} 个没挂上：${out.warn}`;
+  } else if (desired.length > 0 && placed.length === 0 && out.canceled === 0) {
+    // 想挂但一个都没挂成功（通常是精度的 QTY_TOO_SMALL 或名义不足）
+    out.severe = out.warn || '';
+  }
 
   // 止盈/止损之间存在方向颠倒等异常时，提醒一次
   if (skipped.length) {
@@ -1025,6 +1120,8 @@ export async function stopRobot(robotId, opts = {}) {
     for (const side of ['long', 'short']) {
       const qty = ownQty(legs, side);
       if (!(qty > 0)) continue;
+      // P0-3：停止时平仓也要给序号，否则同一次「停止→启动→再停止」会撞同一个 id。
+      const stSeq = Number((get('SELECT COUNT(*) AS c FROM orders WHERE robot_id = ?', robotId) || {}).c || 0) + 1;
       const res = await ex.placeOrder(creds, {
         symbol: row.symbol,
         side: side === 'long' ? 'SELL' : 'BUY',
@@ -1033,10 +1130,12 @@ export async function stopRobot(robotId, opts = {}) {
         quantity: qty,
         price,
         rules,
-        clientOrderId: makeClientId(robotId, side, 999, 'st'),
+        clientOrderId: makeClientId(robotId, side, 999, 'st', stSeq),
       });
       if (res) {
         result.closed.push(side);
+        // 先改账本（内存）后记账，与 tick 里的顺序保持一致
+        drainQty(legs, side, Number(res.executedQty) || qty);
         recordOrder(row.user_id, robotId, row.symbol, {
           side: side === 'long' ? 'SELL' : 'BUY',
           qty: Number(res.executedQty) || qty,
@@ -1064,10 +1163,13 @@ export async function stopRobot(robotId, opts = {}) {
       state_json: JSON.stringify({
         ...state,
         liveLegs: emptyLiveLegs(),
+        takeover: emptyTakeover(),
+        takeoverNotice: {},
         condOrders: [],
         condWarn: '',
       }),
     });
+    clearOrderErrors(robotId);
     if (result.closedCount) {
       logEvent(row.user_id, robotId, 'trade',
         `停止机器人：已平掉实盘 ${result.closed.map((s) => (s === 'long' ? '多' : '空')).join('、')}仓，并撤销了对应的止盈止损单`);

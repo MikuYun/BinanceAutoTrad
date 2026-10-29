@@ -1,6 +1,6 @@
 {
   "name": "binance-quant-terminal",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "币安 U 本位永续合约自动化交易机器人平台（零第三方依赖，自带网页界面）",

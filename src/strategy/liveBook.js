@@ -46,6 +46,7 @@ export function parseLiveLegs(state) {
         openedAt: num(l && l.openedAt) || Date.now(),
         clientId: l && l.clientId ? String(l.clientId) : '',
         reason: l && l.reason ? String(l.reason) : '',
+        source: l && l.source ? String(l.source) : '',
       }))
       .filter((l) => l.qty > 0 && l.entryPrice > 0);
   }
@@ -78,6 +79,8 @@ export function addLeg(legs, side, leg) {
     notional: num(leg.notional) || qty * entryPrice,
     margin: num(leg.margin) || (qty * entryPrice) / (num(leg.leverage) || 1),
     leverage: num(leg.leverage) || 1,
+    // 'takeover' = 从交易所已有持仓接管进来的那一笔（不加仓，只等止盈全平）
+    source: leg.source ? String(leg.source) : '',
     layer: Math.max(1, Math.floor(num(leg.layer) || arr.length + 1)),
     openedAt: num(leg.openedAt) || Date.now(),
     clientId: leg.clientId ? String(leg.clientId) : '',
@@ -127,79 +130,133 @@ export function drainLegs(legs, side, legIds) {
 }
 
 /**
- * 「保留手动仓」的基准快照。
+ * 接管来的仓位块（side → {qty, entryPrice, at} 或 null）。
  *
- * 用户创建实盘机器人时，如果该币已经有持仓，可以选择「保留」：
- * 这些持仓被登记为**手动仓基准**，之后每 tick 对账时先从交易所总量里减掉基准，
- * 剩下的差额才算「机器人自己的 + 后来手动加减的」，避免机器人把用户原本的仓
- * 当成自己加出来的仓去算层数、算均价、去平仓。
- *
- * @param {Array} positions fetchAccount().positions（已按 symbol 过滤）
- * @returns {{long:number, short:number, at:number}}
+ * 为什么要单独记：
+ *   用户在启动机器人时该币可能已经有仓（自己手动开的，或者上一版机器人没记进账本留下的）。
+ *   用户要求「机器人接管这个币的所有仓位」——接管过来的这部分**不加仓**，只按交易所真实均价
+ *   算出的止盈价，到价后一次性全部平掉，然后再从第一层重新开始。
  */
-export function snapshotBaseline(positions) {
-  const list = Array.isArray(positions) ? positions : [];
-  return {
-    long: num((list.find((p) => p && p.side === 'long') || {}).qty),
-    short: num((list.find((p) => p && p.side === 'short') || {}).qty),
-    at: Date.now(),
-  };
+export function emptyTakeover() {
+  return { long: null, short: null };
 }
 
-/** 从 state_json 里读出基准（容错） */
-export function parseBaseline(state) {
-  const b = (state && state.manualBaseline) || {};
-  return { long: num(b.long), short: num(b.short), at: num(b.at) };
+/** 从 state_json 里读出接管块（容错） */
+export function parseTakeover(state) {
+  const src = (state && state.takeover) || {};
+  const out = emptyTakeover();
+  for (const side of SIDES) {
+    const b = src[side];
+    if (b && num(b.qty) > 0 && num(b.entryPrice) > 0) {
+      out[side] = { qty: num(b.qty), entryPrice: num(b.entryPrice), at: num(b.at) || Date.now() };
+    }
+  }
+  return out;
 }
 
-/** 基准是否非空（有任何一个方向 > 0） */
-export function hasBaseline(baseline) {
-  if (!baseline) return false;
-  return num(baseline.long) > 1e-12 || num(baseline.short) > 1e-12;
+/** 某方向是否是「接管仓」（只等止盈、不加仓） */
+export function takeoverSides(takeover) {
+  const out = { long: false, short: false };
+  for (const side of SIDES) {
+    out[side] = Boolean(takeover && takeover[side] && num(takeover[side].qty) > 0);
+  }
+  return out;
 }
 
 /**
- * 与交易所实际持仓对账。
+ * 与交易所实际持仓对账（接管模式）。
  *
- * @param {object} legs 账本（机器人自己的持仓）
- * @param {Array} positions quote.positions（{side,qty,entryPrice,...}）
- * @param {object} [baseline] 手动仓基准（snapshotBaseline 的产物，可为空）
- * @returns {{legs:object, own:object, manual:object, clamped:object, missing:object}}
- *   missing[side] = true 表示「账本里还有机器人的仓，但交易所上这个方向已经空了」
- *   —— 只可能是用户手动把（含机器人的）仓全平了，必须显式告诉用户，不能静默清账本。
+ * 和上一版的区别：上一版会把手动仓当成「永远不碰的基准」隔离掉，结果就是用户报的那个事故——
+ * 机器人下的单没被记进账本时，它以为那是手动仓，于是只按自己账本里那点数量做交易。
+ * 现在改成「交易所是唯一真相源」：
+ *   · 交易所数量 < 账本数量 → 有人（用户）平掉了一部分，账本按实际数量缩减；
+ *   · 交易所数量 > 账本数量 → 多出来的部分**接管**进账本（按增量反解出入场价，
+ *     保证账本加权均价 == 交易所均价），之后会和机器人自己的仓一起被止盈平掉；
+ *   · 交易所已经归零但账本里还有 → 记 missing，显式提醒用户，不能静默清账本。
+ *
+ * @param {object} legs     机器人账本
+ * @param {Array}  positions quote.positions（已按 symbol 过滤，{side,qty,entryPrice,...}）
+ * @param {object} [takeover] 上一轮的接管块（parseTakeover 的产物）
+ * @param {object} [rules]    交易所规则（用 stepSize 算对账容差）
+ * @returns {{legs:object, takeover:object, own:object, adopted:object, drained:object, missing:object, eps:number}}
  */
-export function reconcile(legs, positions, baseline) {
+export function reconcile(legs, positions, takeover, rules) {
   const list = Array.isArray(positions) ? positions : [];
-  const base = baseline || { long: 0, short: 0 };
+  const prev = takeover || emptyTakeover();
   const own = {};
-  const manual = {};
-  const clamped = {};
+  const adopted = {};
+  const drained = {};
   const missing = {};
+  const next = emptyTakeover();
+
+  // 对账容差（用户文档 P1-2）：交易所的数量是按 stepSize 四舍五入报的，
+  // 拿 1e-12 当容差会把「精度误差」误判成「有人手动减仓」，每轮报一次假警告。
+  // 用 stepSize/2 作为容差：差在半个步长之内都当成同一个数。
+  const step = num(rules && rules.stepSize);
+  const eps = Math.max(1e-8, step > 0 ? step / 2 : 0);
+
   for (const side of SIDES) {
-    const rawQty = num((list.find((p) => p && p.side === side) || {}).qty);
+    const pos = list.find((p) => p && p.side === side);
+    const exQty = pos ? num(pos.qty) : 0;
+    const exAvg = pos ? num(pos.entryPrice) : 0;
     const myQty = ownQty(legs, side);
-    // 手动仓基准的「剩余量」：用户减仓时优先认为他减的是自己的仓，而不是机器人的。
-    // 例：用户原有 10 张，机器人开了 1 张（共 11），用户把自己的 10 张全平 → 交易所剩 1 张，
-    //     这时基准应该剩 0、而不是 10，否则机器人会误以为「自己的仓被平光了」然后重新建仓——
-    //     这就是之前那个「手动平仓后机器人重建大仓」的 bug。
-    const baseLeft = Math.max(0, Math.min(num(base[side]), Math.max(0, rawQty - myQty)));
-    // 扣掉用户手动仓（基准剩余）之后，才是机器人可认领的量
-    const exQty = Math.max(0, rawQty - baseLeft);
-    if (myQty > exQty + 1e-12) {
-      // 交易所实际比账本少：用户手动平掉了一部分（甚至含机器人的），账本按实际数量缩减
-      const cut = myQty - exQty;
-      if (exQty <= 1e-12) {
+
+    if (!(exQty > 0)) {
+      // 交易所这个方向已经空了（容差内的小尾巴不算「还有仓」）
+      if (myQty > eps) {
         legs[side] = [];
         missing[side] = true;
-      } else {
-        drainQty(legs, side, cut);
+      } else if (myQty > 0) {
+        // 只是精度尾巴，直接对齐到 0，不报「账本被清空」这种惊人警告
+        legs[side] = [];
       }
-      clamped[side] = cut;
+      own[side] = { qty: ownQty(legs, side), avgEntry: ownAvgEntry(legs, side) };
+      continue;
     }
-    own[side] = { qty: Math.min(ownQty(legs, side), exQty), avgEntry: ownAvgEntry(legs, side) };
-    manual[side] = Math.max(0, rawQty - baseLeft - ownQty(legs, side));
+
+    if (myQty > exQty + eps) {
+      // 交易所比账本少：有人手动平掉了一部分（可能含机器人那份），账本按实际缩减
+      const cut = myQty - exQty;
+      drainQty(legs, side, cut);
+      drained[side] = cut;
+    } else if (myQty < exQty - eps) {
+      // 交易所比账本多：多出来的接管进账本。
+      // 入场价用「增量反解」：总名义(交易所) − 账本已有名义 = 这一笔的名义，
+      // 这样账本的加权均价恰好等于交易所的真实均价，止盈价才是用户要的「实际止盈价」。
+      const addQty = exQty - myQty;
+      const totalNotional = exQty * exAvg;
+      const mineNotional = (legs[side] || []).reduce((s, l) => s + num(l.qty) * num(l.entryPrice), 0);
+      let addEntry = addQty > 0 ? (totalNotional - mineNotional) / addQty : 0;
+      if (!(addEntry > 0)) addEntry = exAvg; // 脏数据兜底，绝不让均价跑飞
+      addLeg(legs, side, {
+        qty: addQty,
+        entryPrice: addEntry,
+        layer: 1,
+        source: 'takeover',
+        reason: '接管交易所已有仓位',
+      });
+      adopted[side] = addQty;
+    }
+
+    // 该方向只要「本轮接管过」或者「上一轮还在接管中」，就持续保持接管模式，
+    // 直到这个方向的仓完全空了（下一轮 exQty<=0 会让 next[side] 回到 null）。
+    // 用户 m06852 的要求就是：一旦有这个方向的仓（不管是机器人还是手动建的），
+    // 就等按真实均价算出的止盈价一次性全平，中途不加仓；平完再重建第一层。
+    const wasTakeover = Boolean(prev[side] && num(prev[side].qty) > 0);
+    const arr = legs[side] || [];
+    const allTakeover = arr.length > 0 && arr.every((l) => l.source === 'takeover');
+    if (adopted[side] || wasTakeover || allTakeover) {
+      next[side] = {
+        qty: ownQty(legs, side),
+        entryPrice: ownAvgEntry(legs, side),
+        at: (prev[side] && prev[side].at) || Date.now(),
+      };
+    }
+
+    own[side] = { qty: ownQty(legs, side), avgEntry: ownAvgEntry(legs, side) };
   }
-  return { legs, own, manual, clamped, missing };
+
+  return { legs, takeover: next, own, adopted, drained, missing, eps };
 }
 
 /** 把账本转成 engine 能吃的 book（复用 paper 的 summarizeSide 路径） */

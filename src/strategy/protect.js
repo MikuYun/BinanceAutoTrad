@@ -11,7 +11,9 @@
  * 真正的下单/撤单由 runner 调用 live.js 完成（本模块不碰网络，方便单测）。
  *
  * 三条红线：
- *   - 数量只填**机器人自己那一份**（ownQty），绝不 closePosition，否则会平掉用户手动仓；
+ *   - 数量填「账本里该方向全部数量」：接管模式（用户 m06852）下账本已经包含从交易所接管过来的仓，
+ *     所以这就是该交易对在该方向上的真实总仓。仍然**绝不 closePosition**（那会连带平掉
+ *     后续新开的手动仓、也无法提前撤单）；
  *   - clientOrderId 由「侧 + 类型 + 触发价 + 数量」派生 —— 同样的意图永远同一个 id，
  *     网络超时重发会被币安按重复 id 拒掉，不会变成两笔单；
  *   - 触发价/数量任何一个变了就换新 id，先撤旧单再挂新单，不会留下幽灵单。
@@ -46,7 +48,7 @@ function r6(v) {
  *
  * @param {object} p
  * @param {string} p.robotId
- * @param {{long:Array, short:Array}} p.legs   机器人自己的持仓账本
+ * @param {{long:Array, short:Array}} p.legs   机器人账本（接管模式下已包含交易所已有仓位）
  * @param {object} p.params                    归一化后的参数
  * @param {number} p.price                     当前标记价（算强平价用）
  * @param {number} p.equity                    账户权益（算强平价用，不是 allocatedCapital）
@@ -74,8 +76,12 @@ export function desiredCondOrders(p) {
     const avgEntry = qtySum > 0 ? notionalSum / qtySum : 0;
     if (!(avgEntry > 0)) continue;
 
+    // 接管模式（用户 m06852）：这一边含从交易所接管来的仓位时，止盈必须整边一起平 ——
+    // 否则逐笔止盈只平机器人那几笔，同价位还会再挂一堆单，跟「到止盈价全部平掉」不符。
+    const hasTakeover = arr.some((x) => x.source === 'takeover');
+
     /* ---------- 止盈 ---------- */
-    if (tpMode === 'layer') {
+    if (tpMode === 'layer' && !hasTakeover) {
       for (const leg of arr) {
         const qty = Number(leg.qty);
         const entry = Number(leg.entryPrice);

@@ -170,7 +170,7 @@ At most **20** (beyond that the API answers 「最多创建 20 个机器人」, 
 | **重置** (Reset) | Paper mode: cleared; live mode: **exchange positions are not closed** | Cleared, recomputed from layer 0 | You want a fresh start |
 | **删除** (Delete) | Same as reset | Also deletes orders, events, curve | You no longer want the bot |
 
-⚠️ **The live-mode "reset" trap**: it only clears the bot's own ledger; the positions remain on the exchange. After a restart those positions are treated as 「手动仓」 (manual positions) and the bot no longer manages them — it will neither take profit nor stop out for you.
+⚠️ **The live-mode "reset" trap**: it only clears the bot's own ledger; the positions remain on the exchange. After a restart those positions are **taken over by the bot**: it computes a take-profit from the exchange's real average entry and closes the whole side in one go when that level is hit. So after a reset the bot adopts the position instead of ignoring it.
 
 Changing parameters requires **stopping** the bot first (a running bot answers 「请先停止机器人再修改参数」, stop the bot before changing parameters).
 
@@ -232,18 +232,22 @@ The egress IP must match the key's IP whitelist, otherwise you get `-2015`; an i
 
 ### Q24: Will the bot close positions I opened by hand?
 
-**No.** This is the most carefully handled part of the whole project.
+**Yes — and that is the intended design** (changed in 1.0.2 at the user's request).
 
 Under Binance hedge mode, longs in the same symbol are **aggregated at account level** — the exchange cannot tell which order belongs to whom. So the program maintains 「本机器人自己的持仓账本」 (the bot's own position ledger) inside `state_json` and reconciles it against the exchange every round:
 
-- The exchange shows **more** than the ledger → treated as a manual position; it logs 「检测到 多/空 有 N 张非机器人仓位（手动仓），机器人不会动它」 (detected N long/short contracts not opened by the bot — manual position, the bot will not touch it) and then ignores it.
-- The exchange shows **less** than the ledger → it assumes you closed part of it by hand and shrinks the ledger accordingly.
+- The exchange shows **more** than the ledger → the excess is **taken over into the ledger entirely**: 「接管：多单已有 N 张不是机器人开的仓位，已全部接管（实际均价 X）。接管仓位不加仓，等止盈价 Y 一次性全平。」 (Takeover: N long contracts that were not opened by the bot have been adopted at the real average entry X; adopted positions are not scaled in and are closed in one go at take-profit Y.)
+- The exchange shows **less** than the ledger → it assumes you closed part of it by hand and shrinks the ledger (tolerance = half of the quantity step size).
 
-Closing also only ever closes 「自己账本里那部分数量」 (the quantity recorded in its own ledger) with `reduceOnly`, so it cannot go out of bounds. **The one exception**: if you hit 「重置」 (Reset) on a live bot, the ledger is emptied and the exchange positions become unclaimed 「手动仓」 (manual positions) that the bot will never manage again.
+While in takeover mode the bot **does not add to the position**; it waits for the take-profit computed from the exchange's real average entry and closes the **whole side in one go**, then rebuilds the first tranche.
+
+> Why this design: earlier versions "never touched manual positions", which left the bot's ledger permanently out of sync with the exchange and actually caused a live incident. The current principle is that **the exchange is the only source of truth** — every position on that symbol belongs to the bot.
+>
+> If you **really don't** want the bot to touch a position, the way to do it is: **don't assign that symbol to a bot** (or close it by hand before starting the bot).
 
 ### Q25: Are take-profit and stop-loss monitored by the program, or resting on the exchange?
 
-The program checks the price every **5 seconds** (adjustable with the environment variable `TICK_INTERVAL_MS`) and closes at market when a level is hit; in live mode it **also** keeps `TAKE_PROFIT_MARKET` / `STOP_MARKET` conditional orders in sync (triggered on mark price), reconciling every 60 seconds by cancelling the old ones and placing new ones. The point of running both legs: **if the program dies, the network drops, or the machine shuts down, a protective order is still resting on the exchange**. Conditional orders only ever cover the bot's own quantity and never touch manual positions; if one cannot be placed, an event is logged — it never fails silently.
+The program checks the price every **5 seconds** (adjustable with the environment variable `TICK_INTERVAL_MS`) and closes at market when a level is hit; in live mode it **also** keeps exchange-side conditional orders in sync (since 1.0.2 these go through the **Algo Order API**, because Binance has disabled `STOP_MARKET` / `TAKE_PROFIT_MARKET` on `/fapi/v1/order`), reconciling every 60 seconds by cancelling the old ones and placing new ones. The point of running both legs: **if the program dies, the network drops, or the machine shuts down, a protective order is still resting on the exchange**. The conditional order quantity covers the full ledger quantity for that side (in takeover mode that already includes positions that existed on the exchange); if one cannot be placed, an error-level event is logged — it never fails silently.
 
 ### Q26: Do I need 「双向持仓模式」 (hedge mode)? Do positions survive a server restart?
 

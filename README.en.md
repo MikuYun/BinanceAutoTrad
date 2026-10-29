@@ -268,39 +268,33 @@ $env:LIVE_TRADING=1; node server.js
 LIVE_TRADING=1 node server.js
 ```
 
-### The Bot Won't Close Positions You Opened Manually
+### The Bot Takes Over Every Position On That Symbol
 
 Binance's hedge-mode positions are **aggregated at the account level** — the API only tells you "you have 4.37 contracts long on this symbol", and cannot tell which entries the bot opened and which you opened by hand.
 
-This project's approach: every live bot keeps **its own position ledger**.
+**Since 1.0.2 this is takeover mode** (at the user's request): once the bot starts, it takes over the **entire position** on that symbol.
 
-- Bot opens a position successfully → recorded in the ledger
-- Every tick reconciles against the exchange's actual position
-- Exchange quantity **greater than** the ledger → the excess is treated as a **manual position**, flagged, and **never closed** by the bot
-- You close it manually on Binance → the ledger shrinks proportionally instead of trying to close a position that no longer exists
-
-So manual positions and bot positions can coexist.
-
-### When Creating a Live Bot, You Decide What to Do with Existing Positions
-
-**This is a serious bug that 1.0.1 fixed**: early versions did not record which positions you already held, so every reconciliation round was a fresh guess. That produced two failure modes:
-
-- The bot assumed everything on the exchange was yours → it only accounted for a small slice, leaving **a large position on the account and a tiny one for the bot**
-- You manually closed everything → the bot's ledger was silently emptied → next round it thought "I have no position" and **opened another one**
-
-Now, when you create a live bot and the symbol you picked already has a position, it checks once and shows a prompt:
-
-| Option | Behaviour |
+| When | What happens |
 |---|---|
-| **不保留，从零开始 (Don't keep it, start from zero)** (recommended) | The bot ignores your existing position entirely and only counts what it opens itself. You close your own position; the bot won't touch it |
-| **保留为「手动仓」 (Keep it as a manual position)** | Registers the current position as a **baseline snapshot**. The bot then runs normally on its parameters but **never uses that position when computing add sizes, average price or take-profit price**. The top of the details page keeps showing 「手动仓基准 多 X / 空 Y 张（不参与计算）」 (Manual baseline: long X / short Y contracts, excluded from calculations) |
+| A position already exists on that symbol when the bot starts (yours, or left behind by an older bot — all of it counts) | **Everything is recorded into the bot's ledger**; the average entry is solved back from the exchange's real average, the bot **does not add to the position**, and it waits for the take-profit computed from that real average, then closes **the whole side in one go** |
+| After the whole side is closed | Takeover mode ends automatically; the bot rebuilds **the first tranche** and then runs normally (adding / taking profit per its parameters) |
+| You manually reduce the position | The ledger shrinks to match the actual quantity (it will never try to close something that no longer exists) |
+| You manually add more than the ledger holds | The excess is taken over into the ledger as well |
 
-If you pick 「保留」 (Keep), the baseline is **re-snapshotted on first start** (time may pass between creating and actually starting the bot, and the position will have moved). If the bot already holds its own position, no re-snapshot happens — otherwise the bot's own position would be mistaken for a manual one.
+Key points:
 
-Also, previously, when you manually closed a position that included the bot's share, the bot cleared its ledger **silently**; now it writes an explicit warning:
+- **The take-profit price uses the exchange's real average entry** (not an average the bot predicted), so "close it when the level is hit" is a genuinely real take-profit.
+- No scaling in during takeover — adding to a losing position before the take-profit level is reached only makes the risk worse.
+- Takeover positions are **still protected by the hard stop-loss**; it does not just wait for take-profit.
+- Even if you set take-profit mode to 「逐笔止盈」 (per-tranche), during takeover the bot is forced to **close the whole side in one go** rather than only part of it.
 
-> 对账：多单在交易所已归零，但机器人账本里还有 1.234567 张。说明你手动把这个方向的仓（含机器人的部分）平掉了……
-> *(Reconciliation: the long position is now zero on the exchange, but the bot's ledger still holds 1.234567 contracts. This means you manually closed the position in this direction, including the bot's share…)*
+Reconciliation events (visible under 「事件」 on the details page):
+
+> 接管：多单已有 3.4 张不是机器人开的仓位，已全部接管（实际均价 0.939206）。接管仓位不加仓，等止盈价 0.955000 一次性全平。
+> *(Takeover: 3.4 long contracts were not opened by the bot; all of them have been adopted at the real average entry 0.939206. Adopted positions are not scaled in; they will be closed in one go at take-profit 0.955000.)*
+
+> 对账：多单在交易所已归零，机器人账本也同步清空。下一次 tick 会重新建第一层。
+> *(Reconciliation: the long position is now zero on the exchange, and the bot's ledger has been cleared to match. The next tick will rebuild the first tranche.)*
 
 ---
 
